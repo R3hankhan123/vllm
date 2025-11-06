@@ -8,7 +8,7 @@ import functools
 import json
 import sys
 from collections.abc import Callable
-from dataclasses import MISSING, dataclass, fields, is_dataclass
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from itertools import permutations
 from types import UnionType
 from typing import (
@@ -438,7 +438,7 @@ class EngineArgs:
     aggregate_engine_logging: bool = False
     revision: str | None = ModelConfig.revision
     code_revision: str | None = ModelConfig.code_revision
-    rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
+    rope_scaling: dict[str, Any] = field(default_factory=dict)
     rope_theta: float | None = ModelConfig.rope_theta
     hf_token: bool | str | None = ModelConfig.hf_token
     hf_overrides: HfOverrides = get_field(ModelConfig, "hf_overrides")
@@ -1348,22 +1348,22 @@ class EngineArgs:
         # Set default arguments for V1 Engine.
         self._set_default_args(usage_context, model_config)
         # Disable chunked prefill and prefix caching for:
-        # POWER (ppc64le)/ARM/s390x/RISCV CPUs in V1
+        # POWER (ppc64le)/ARM/RISCV CPUs in V1
+        # Note: S390X now supports these features with optimized vector operations
         if current_platform.is_cpu() and current_platform.get_cpu_architecture() in (
             CpuArchEnum.POWERPC,
-            CpuArchEnum.S390X,
             CpuArchEnum.ARM,
             CpuArchEnum.RISCV,
         ):
             logger.info(
-                "Chunked prefill is not supported for ARM and POWER, "
-                "S390X and RISC-V CPUs; "
+                "Chunked prefill is not supported for ARM, POWER, "
+                "and RISC-V CPUs; "
                 "disabling it for V1 backend."
             )
             self.enable_chunked_prefill = False
             logger.info(
-                "Prefix caching is not supported for ARM and POWER, "
-                "S390X and RISC-V CPUs; "
+                "Prefix caching is not supported for ARM, POWER, "
+                "and RISC-V CPUs; "
                 "disabling it for V1 backend."
             )
             self.enable_prefix_caching = False

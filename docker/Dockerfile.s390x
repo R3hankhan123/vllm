@@ -120,56 +120,18 @@ ARG NUMBA_VERSION=0.61.2
 
 WORKDIR /tmp
 
-# Clone all required dependencies
+# Install LLVM 15 from EPEL and clone required dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    microdnf install ninja-build gcc gcc-c++ -y && \
-    git clone --recursive https://github.com/llvm/llvm-project.git -b llvmorg-15.0.7  && \
+    rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+    microdnf install -y llvm15 llvm15-devel llvm15-static && \
+    microdnf clean all && \
     git clone --recursive https://github.com/numba/llvmlite.git -b v0.44.0 && \
     git clone --recursive https://github.com/numba/numba.git -b ${NUMBA_VERSION} && \
-    cd llvm-project && mkdir build && cd  build && \
     uv pip install 'cmake<4' setuptools numpy && \
-    export PREFIX=/usr/local && CMAKE_ARGS="${CMAKE_ARGS} -DLLVM_ENABLE_PROJECTS=lld;libunwind;compiler-rt" \
-    CFLAGS="$(echo $CFLAGS | sed 's/-fno-plt //g')" \
-    CXXFLAGS="$(echo $CXXFLAGS | sed 's/-fno-plt //g')" \
-    CMAKE_ARGS="${CMAKE_ARGS} -DFFI_INCLUDE_DIR=$PREFIX/include" \
-    CMAKE_ARGS="${CMAKE_ARGS} -DFFI_LIBRARY_DIR=$PREFIX/lib" \
-    cmake -DCMAKE_INSTALL_PREFIX="${PREFIX}"               \
-        -DCMAKE_BUILD_TYPE=Release                       \
-        -DCMAKE_LIBRARY_PATH="${PREFIX}"                 \
-        -DLLVM_ENABLE_LIBEDIT=OFF                        \
-        -DLLVM_ENABLE_LIBXML2=OFF                        \
-        -DLLVM_ENABLE_RTTI=ON                            \
-        -DLLVM_ENABLE_TERMINFO=OFF                       \
-        -DLLVM_INCLUDE_BENCHMARKS=OFF                    \
-        -DLLVM_INCLUDE_DOCS=OFF                          \
-        -DLLVM_INCLUDE_EXAMPLES=OFF                      \
-        -DLLVM_INCLUDE_GO_TESTS=OFF                      \
-        -DLLVM_INCLUDE_TESTS=OFF                         \
-        -DLLVM_INCLUDE_UTILS=ON                          \
-        -DLLVM_INSTALL_UTILS=ON                          \
-        -DLLVM_UTILS_INSTALL_DIR=libexec/llvm            \
-        -DLLVM_BUILD_LLVM_DYLIB=OFF                      \
-        -DLLVM_LINK_LLVM_DYLIB=OFF                       \
-        -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=WebAssembly \
-        -DLLVM_ENABLE_FFI=ON                             \
-        -DLLVM_ENABLE_Z3_SOLVER=OFF                      \
-        -DLLVM_OPTIMIZED_TABLEGEN=ON                     \
-        -DCMAKE_POLICY_DEFAULT_CMP0111=NEW               \
-        -DCOMPILER_RT_BUILD_BUILTINS=ON                  \
-        -DCOMPILER_RT_BUILTINS_HIDE_SYMBOLS=OFF          \
-        -DCOMPILER_RT_BUILD_LIBFUZZER=OFF                \
-        -DCOMPILER_RT_BUILD_CRT=OFF                      \
-        -DCOMPILER_RT_BUILD_MEMPROF=OFF                  \
-        -DCOMPILER_RT_BUILD_PROFILE=OFF                  \
-        -DCOMPILER_RT_BUILD_SANITIZERS=OFF               \
-        -DCOMPILER_RT_BUILD_XRAY=OFF                     \
-        -DCOMPILER_RT_BUILD_GWP_ASAN=OFF                 \
-        -DCOMPILER_RT_BUILD_ORC=OFF                      \
-        -DCOMPILER_RT_INCLUDE_TESTS=OFF                  \
-        ${CMAKE_ARGS} -GNinja ../llvm                    \
-    && ninja install  . && \
     #  build llvmlite
-    cd ../../llvmlite && python setup.py bdist_wheel && \
+    cd llvmlite && \
+    export LLVM_CONFIG=/usr/bin/llvm-config-15 && \
+    python setup.py bdist_wheel && \
     cd ../numba && \
     if ! grep '#include "dynamic_annotations.h"' numba/_dispatcher.cpp; then \
        sed -i '/#include "internal\/pycore_atomic.h"/i\#include "dynamic_annotations.h"' numba/_dispatcher.cpp; \
@@ -247,8 +209,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Build and install vllm
 RUN --mount=type=cache,target=/root/.cache/uv \
-    VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 python setup.py bdist_wheel && \
-    uv pip install "$(echo dist/*.whl)[tensorizer]"
+    # Clear any stale bytecode cache before build
+    find /workspace -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true && \
+    find /workspace -type f -name "*.pyc" -delete 2>/dev/null || true && \
+    # Build wheel without writing bytecode
+    PYTHONDONTWRITEBYTECODE=1 VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 python setup.py bdist_wheel && \
+    # Install wheel with --force-reinstall to bypass any cached installation
+    uv pip install --force-reinstall --no-deps "$(echo dist/*.whl)" && \
+    uv pip install "$(echo dist/*.whl)[tensorizer]" && \
+    # Aggressively clear ALL Python bytecode cache
+    find /opt/vllm -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/vllm -type f -name "*.pyc" -delete 2>/dev/null || true && \
+    # Recompile everything fresh
+    python -m compileall -f -q /opt/vllm/lib64/python${PYTHON_VERSION}/site-packages/vllm/
 
 # setup non-root user for vllm
 RUN umask 002 && \
@@ -258,6 +231,13 @@ RUN umask 002 && \
 
 COPY LICENSE /licenses/vllm.md
 COPY examples/*.jinja /app/data/template/
+# Install LLVM 15 runtime libraries (required by numba/llvmlite)
+RUN rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+    microdnf install -y llvm15-libs && \
+    microdnf clean all
+ENV LD_LIBRARY_PATH="/opt/vllm/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/usr/local/lib:/opt/rh/gcc-toolset-14/root/usr/lib64:/usr/lib64/llvm15/lib:$LD_LIBRARY_PATH"
+
+# Set correct library path for torch, numactl, and LLVM
 
 USER 2000
 WORKDIR /home/vllm
