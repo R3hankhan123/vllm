@@ -4,6 +4,8 @@
 
 #include <torch/library.h>
 
+#include "sgl-kernels/gemm_s390x.h"
+
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
 void release_dnnl_matmul_handler(int64_t handler);
@@ -257,6 +259,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
   ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
            &int8_scaled_mm_with_quant);
+#endif
+
+  // s390x VXE-optimized GEMM kernels
+#if defined(__s390x__)
+  ops.def("s390x_gemm(Tensor mat1, Tensor mat2, Tensor? bias) -> Tensor");
+  ops.impl("s390x_gemm", torch::kCPU, &s390x_gemm);
+  ops.def("s390x_gemm_packed(Tensor mat1, Tensor mat2_packed, Tensor? bias) -> Tensor");
+  ops.impl("s390x_gemm_packed", torch::kCPU, &s390x_gemm_packed);
 #endif
 
   // CPU attention kernels

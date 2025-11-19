@@ -192,13 +192,70 @@ def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     )
 
 
+def check_s390x_vxe_gemm(dtype: torch.dtype) -> bool:
+    """Check if s390x VXE-optimized GEMM is available and applicable.
+    
+    Note: s390x VXE GEMM works most efficiently with FP32. For BF16 models,
+    we automatically convert weights to FP32 and handle BF16↔FP32 conversions
+    transparently for optimal performance.
+    """
+    import platform
+    return (
+        platform.machine() == "s390x"
+        and dtype in (torch.float32, torch.bfloat16)
+        and hasattr(torch.ops, "_C")
+        and hasattr(torch.ops._C, "s390x_gemm")
+    )
+
+
 def dispatch_cpu_unquantized_gemm(
     layer: torch.nn.Module,
     remove_weight: bool,
 ) -> None:
     N, K = layer.weight.size()
     dtype = layer.weight.dtype
-    if envs.VLLM_CPU_SGL_KERNEL and check_cpu_sgl_kernel(N, K, dtype):
+    
+    # s390x VXE-optimized GEMM (highest priority on s390x)
+    if check_s390x_vxe_gemm(dtype):
+        # For BF16: convert to FP32 for better performance (s390x VXE is FP32-native)
+        if dtype == torch.bfloat16:
+            logger.info_once(
+                f"Using s390x VXE-optimized GEMM (FP32) for BF16 layer [{N}, {K}] "
+                f"(converting weights to FP32 for optimal performance)"
+            )
+            # Convert weights to FP32 once at initialization
+            weight_t_fp32 = layer.weight.t().contiguous().to(torch.float32)
+            bias_fp32 = layer.bias.to(torch.float32) if getattr(layer, "bias", None) is not None else None
+            
+            def s390x_linear_bf16_fn(x, _weight_ignored, _bias_ignored):
+                # Convert input BF16→FP32, compute in FP32, convert output FP32→BF16
+                x_contiguous = x.contiguous()
+                x_fp32 = x_contiguous.to(torch.float32)
+                out_fp32 = torch.ops._C.s390x_gemm_packed(x_fp32, weight_t_fp32, bias_fp32)
+                return out_fp32.to(torch.bfloat16)
+            
+            layer.cpu_linear = s390x_linear_bf16_fn
+        else:
+            logger.info_once(
+                f"Using s390x VXE-optimized GEMM for layer with shape [{N}, {K}] "
+                f"and dtype {dtype}"
+            )
+            # FP32 path (native, most efficient)
+            weight_t = layer.weight.t().contiguous()
+            bias = layer.bias if getattr(layer, "bias", None) is not None else None
+            
+            def s390x_linear_fp32_fn(x, _weight_ignored, _bias_ignored):
+                x = x.contiguous()
+                return torch.ops._C.s390x_gemm_packed(x, weight_t, bias)
+            
+            layer.cpu_linear = s390x_linear_fp32_fn
+        
+        if remove_weight:
+            layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        return
+    
+    # Intel AMX tile kernel
+    elif envs.VLLM_CPU_SGL_KERNEL and check_cpu_sgl_kernel(N, K, dtype):
         packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
         if getattr(layer, "bias", None) is not None:
             bias_f32 = layer.bias.to(torch.float32)

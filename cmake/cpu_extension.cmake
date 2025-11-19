@@ -195,6 +195,8 @@ elseif (S390_FOUND)
         "-mzvector"
         "-march=native"
         "-mtune=native")
+    add_compile_definitions(-DCPU_CAPABILITY_VXE)
+    message(STATUS "s390x VXE support enabled")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     if(RVV_FOUND)
 	    message(FAIL_ERROR "Can't support rvv now.")
@@ -392,6 +394,13 @@ endif()
 if(USE_ONEDNN)
     set(VLLM_EXT_SRC
         "csrc/cpu/dnnl_kernels.cpp"
+        ${VLLM_EXT_SRC})
+endif()
+
+# Add s390x GEMM kernels if S390 is detected
+if(S390_FOUND)
+    set(VLLM_EXT_SRC
+        "csrc/cpu/sgl-kernels/gemm_s390x.cpp"
         ${VLLM_EXT_SRC})
 endif()
 

@@ -14,6 +14,28 @@ logger = init_logger(__name__)
 
 current_platform.import_kernels()
 
+
+def is_s390x_vxe_gemm_available() -> bool:
+    """
+    Check if the s390x VXE-optimized GEMM kernel is available and will be used.
+    
+    Returns:
+        bool: True if s390x GEMM kernel is available and can be used, False otherwise.
+    
+    Note:
+        The kernel is available when:
+        - Running on s390x architecture (IBM Z)
+        - torch.ops._C.s390x_gemm is compiled and registered
+        
+        The kernel will automatically be used for CPU linear layers when running
+        on s390x with float32 or bfloat16 tensors.
+    """
+    import platform
+    if platform.machine() != "s390x":
+        return False
+    return hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "s390x_gemm")
+
+
 if TYPE_CHECKING:
 
     def register_fake(fn):
@@ -1402,6 +1424,35 @@ if hasattr(torch.ops._C, "permute_cols"):
 
 def permute_cols(a: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.permute_cols(a, perm)
+
+
+# s390x VXE-optimized GEMM
+if hasattr(torch.ops._C, "s390x_gemm"):
+
+    @register_fake("_C::s390x_gemm")
+    def _s390x_gemm_fake(
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Fake implementation for s390x_gemm: C[M,N] = A[M,K] @ B[K,N] + bias[N]"""
+        M = mat1.size(0) if mat1.dim() == 2 else mat1.numel() // mat1.size(-1)
+        N = mat2.size(1)
+        return torch.empty((M, N), dtype=mat1.dtype, device=mat1.device)
+
+
+if hasattr(torch.ops._C, "s390x_gemm_packed"):
+
+    @register_fake("_C::s390x_gemm_packed")
+    def _s390x_gemm_packed_fake(
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Fake implementation for s390x_gemm_packed: C[M,N] = A[M,K] @ B[K,N] + bias[N]"""
+        M = mat1.size(0) if mat1.dim() == 2 else mat1.numel() // mat1.size(-1)
+        N = mat2.size(1)
+        return torch.empty((M, N), dtype=mat1.dtype, device=mat1.device)
 
 
 # fp4
