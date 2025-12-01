@@ -861,7 +861,12 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             # Just to add remaining `content`
                             if self.reasoning_parser:
-                                delta_text = previous_text + delta_text
+                                # Strip whitespace-only content between reasoning
+                                # and tool calls to avoid unwanted "\n\n" content
+                                if previous_text and not previous_text.strip():
+                                    delta_text = delta_text
+                                else:
+                                    delta_text = previous_text + delta_text
                                 current_text = ""
 
                             if function_name_returned[i]:
@@ -925,7 +930,11 @@ class OpenAIServingChat(OpenAIServing):
 
                         else:
                             # either finished reasoning or no reasoning at all
+                            # Strip leading whitespace from current_text when
+                            # transitioning from reasoning to tool calls
                             content = current_text
+                            if content and self.reasoning_parser and reasoning_end_arr[i]:
+                                content = content.lstrip()
 
                             delta_message, function_name_returned[i] = (
                                 self.extract_tool_call_required_streaming(
@@ -1008,8 +1017,14 @@ class OpenAIServingChat(OpenAIServing):
                                 added_content_delta_arr[i] = True
                                 previous_text = ""
                                 previous_token_ids = []
-                                delta_text = current_text
-                                delta_token_ids = current_token_ids
+                                # Strip whitespace-only content between reasoning
+                                # and tool calls to avoid unwanted "\n\n" content
+                                if current_text and not current_text.strip():
+                                    delta_text = ""
+                                    delta_token_ids = []
+                                else:
+                                    delta_text = current_text
+                                    delta_token_ids = current_token_ids
 
                             delta_message = tool_parser.extract_tool_calls_streaming(
                                 previous_text=previous_text,

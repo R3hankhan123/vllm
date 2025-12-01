@@ -81,6 +81,7 @@ FUNC_ARGS = """{"city": "Dallas", "state": "TX", "unit": "fahrenheit"}"""
 
 def extract_reasoning_and_calls(chunks: list):
     reasoning = ""
+    content = ""
     tool_call_idx = -1
     arguments = []
     function_names = []
@@ -101,7 +102,9 @@ def extract_reasoning_and_calls(chunks: list):
         else:
             if hasattr(chunk.choices[0].delta, "reasoning"):
                 reasoning += chunk.choices[0].delta.reasoning
-    return reasoning, arguments, function_names
+            if hasattr(chunk.choices[0].delta, "content") and chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+    return reasoning, arguments, function_names, content
 
 
 # test streaming
@@ -119,10 +122,12 @@ async def test_chat_streaming_of_tool_and_reasoning(client: openai.AsyncOpenAI):
     async for chunk in stream:
         chunks.append(chunk)
 
-    reasoning, arguments, function_names = extract_reasoning_and_calls(chunks)
+    reasoning, arguments, function_names, content = extract_reasoning_and_calls(chunks)
     assert len(reasoning) > 0
     assert len(function_names) > 0 and function_names[0] == FUNC_NAME
     assert len(arguments) > 0 and arguments[0] == FUNC_ARGS
+    # Ensure no unwanted whitespace content between reasoning and tool calls
+    assert content == "", f"Unexpected content between reasoning and tool calls: {repr(content)}"
 
 
 # test full generate
