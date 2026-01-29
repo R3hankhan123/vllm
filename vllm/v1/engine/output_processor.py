@@ -183,16 +183,32 @@ class RequestState:
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
-        # TODO also include relevant output tokens in new prompt here
-        #     (match scheduler behavior).
+
+        # Include output tokens from previous generation into the new prompt
+        # to maintain context for streaming/resumable requests.
+        if self.detokenizer is not None:
+            output_token_ids = self.detokenizer.output_token_ids
+            output_text = self.detokenizer.output_text
+        else:
+            output_token_ids = []
+            output_text = ""
+
         if update.prompt:
             self.prompt = (
-                (self.prompt + update.prompt) if self.prompt else update.prompt
+                (self.prompt + output_text + update.prompt)
+                if self.prompt
+                else output_text + update.prompt
             )
+        elif output_text:
+            self.prompt = (self.prompt + output_text) if self.prompt else output_text
+
         if self.prompt_token_ids:
+            self.prompt_token_ids.extend(output_token_ids)
             self.prompt_token_ids.extend(update.prompt_token_ids or ())
         else:
-            self.prompt_token_ids = update.prompt_token_ids or []
+            self.prompt_token_ids = list(output_token_ids)
+            self.prompt_token_ids.extend(update.prompt_token_ids or ())
+
         assert self.prompt_token_ids is not None
         self.prompt_len = len(self.prompt_token_ids)
         if self.stats is not None:
