@@ -19,6 +19,9 @@ class LogicalCPUInfo:
     id: int = -1
     physical_core: int = -1
     numa_node: int = -1
+    socket: int = -1
+    book: int = -1
+    drawer: int = -1
 
     @classmethod
     def _int(cls, value: str) -> int:
@@ -33,12 +36,18 @@ class LogicalCPUInfo:
         id = obj_dict.get("cpu")
         physical_core = obj_dict.get("core")
         numa_node = obj_dict.get("node")
+        socket = obj_dict.get("socket")
+        book = obj_dict.get("book")
+        drawer = obj_dict.get("drawer")
 
         if not (id is None or physical_core is None or numa_node is None):
             return LogicalCPUInfo(
                 id=LogicalCPUInfo._int(id),
                 physical_core=LogicalCPUInfo._int(physical_core),
                 numa_node=LogicalCPUInfo._int(numa_node),
+                socket=LogicalCPUInfo._int(socket) if socket is not None else -1,
+                book=LogicalCPUInfo._int(book) if book is not None else -1,
+                drawer=LogicalCPUInfo._int(drawer) if drawer is not None else -1,
             )
         else:
             return obj_dict
@@ -119,7 +128,7 @@ def get_allowed_cpu_list() -> list[LogicalCPUInfo]:
     if platform.system() == "Darwin":
         return cpu_list
 
-    global_allowed_cpu_id_list = os.sched_getaffinity(0)
+    global_allowed_cpu_id_list = os.sched_getaffinity(0)  # type: ignore[attr-defined]
     logical_cpu_list = [x for x in cpu_list if x.id in global_allowed_cpu_id_list]
 
     return logical_cpu_list
@@ -155,17 +164,20 @@ def _get_cpu_list() -> list[LogicalCPUInfo]:
         return [LogicalCPUInfo(i, i, 0) for i in range(cpu_count)]
 
     lscpu_output = subprocess.check_output(
-        "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
+        "lscpu -J -e=CPU,CORE,SOCKET,NODE,BOOK,DRAWER", shell=True, text=True
     )
 
-    # For platform without NUMA, replace '-' to '0'
+    # For platforms without NUMA/SOCKET/BOOK/DRAWER, replace '-' to '0'
     lscpu_output = re.sub(r'"node":\s*-\s*(,|\n)', r'"node": 0\1', lscpu_output)
+    lscpu_output = re.sub(r'"socket":\s*-\s*(,|\n)', r'"socket": 0\1', lscpu_output)
+    lscpu_output = re.sub(r'"book":\s*-\s*(,|\n)', r'"book": 0\1', lscpu_output)
+    lscpu_output = re.sub(r'"drawer":\s*-\s*(,|\n)', r'"drawer": 0\1', lscpu_output)
 
     logical_cpu_list: list[LogicalCPUInfo] = json.loads(
         lscpu_output, object_hook=LogicalCPUInfo.json_decoder
     )["cpus"]
 
-    # Filter CPUs with invalid attributes
+    # Filter CPUs with invalid attributes (only require id, core, node)
     logical_cpu_list = [
         x for x in logical_cpu_list if -1 not in (x.id, x.physical_core, x.numa_node)
     ]
