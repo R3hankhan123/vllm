@@ -9,6 +9,11 @@
 #define CPU_CAPABILITY_AVX512
 #endif
 
+#if defined(__s390x__) && defined(__VX__) && defined(__VXEXT__)
+#define CPU_CAPABILITY_VXE
+#include <vecintrin.h>
+#endif
+
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 
@@ -113,7 +118,30 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #endif
 }
 
-#endif
+#endif  // CPU_CAPABILITY_AVX512
+
+#if defined(CPU_CAPABILITY_VXE)
+
+// VXE BF16 to FP32 conversion
+// On s390x (big-endian), BF16 is stored as [16-bit BF16 | 16-bit zero]
+inline void cvt_bf16_to_fp32_vxe(__vector unsigned short bf16_vec, __vector float& fp32_0, __vector float& fp32_1) {
+  __vector unsigned short zeros = vec_splat_u16(0);
+  // Expand BF16 to FP32 by merging with zeros
+  fp32_0 = (__vector float)vec_mergeh(bf16_vec, zeros);
+  fp32_1 = (__vector float)vec_mergel(bf16_vec, zeros);
+}
+
+// VXE FP32 to BF16 conversion
+inline __vector unsigned short cvt_fp32_to_bf16_vxe(__vector float fp32_0, __vector float fp32_1) {
+  // Extract high 16 bits of each FP32 to get BF16
+  // On big-endian, we just pack the high shorts
+  return vec_pack((__vector unsigned int)fp32_0, (__vector unsigned int)fp32_1);
+}
+
+#define CVT_BF16_TO_FP32_VXE(bf16, f0, f1) cvt_bf16_to_fp32_vxe(bf16, f0, f1)
+#define CVT_FP32_TO_BF16_VXE(f0, f1) cvt_fp32_to_bf16_vxe(f0, f1)
+
+#endif  // CPU_CAPABILITY_VXE
 
 // vector to scalar reduction
 #if defined(CPU_CAPABILITY_AVX512) && 0

@@ -200,35 +200,57 @@ class OMPProcessManager:
 
         local_world_size = self.local_world_size
 
-        # Detect if we need book/socket-aware binding (e.g., s390x, POWER)
-        # Check if we have multiple books/sockets within a single NUMA node
+        # Detect if we need drawer/book/socket-aware binding
+        # s390x hierarchy: drawer > book > socket > core
         cpu_arch = current_platform.get_cpu_architecture()
+        use_drawer_aware_binding = False
         use_book_aware_binding = False
         use_socket_aware_binding = False
         num_topology_domains = len(allowed_numa_nodes)
 
         if cpu_arch == CpuArchEnum.S390X:
-            # For s390x, check if we have multiple books within NUMA nodes
-            books_per_numa: dict[int, set[int]] = {}
+            # Priority 1: Check for multiple drawers
+            drawers_per_numa: dict[int, set[int]] = {}
             for cpu in logical_cpu_list:
-                if cpu.book >= 0:
+                if cpu.drawer >= 0:
                     key = cpu.numa_node
-                    if key not in books_per_numa:
-                        books_per_numa[key] = set()
-                    books_per_numa[key].add(cpu.book)
-            # If any NUMA node has multiple books, use book-aware binding
-            use_book_aware_binding = any(
-                len(books) > 1 for books in books_per_numa.values()
+                    if key not in drawers_per_numa:
+                        drawers_per_numa[key] = set()
+                    drawers_per_numa[key].add(cpu.drawer)
+            use_drawer_aware_binding = any(
+                len(drawers) > 1 for drawers in drawers_per_numa.values()
             )
-            if use_book_aware_binding:
-                # Count unique (numa_node, book) pairs as topology domains
+
+            if use_drawer_aware_binding:
+                # Use drawer-level binding (highest isolation)
                 num_topology_domains = len(
                     set(
-                        (cpu.numa_node, cpu.book)
+                        (cpu.numa_node, cpu.drawer)
                         for cpu in logical_cpu_list
-                        if cpu.book >= 0
+                        if cpu.drawer >= 0
                     )
                 )
+            else:
+                # Priority 2: Check for multiple books per NUMA node
+                books_per_numa: dict[int, set[int]] = {}
+                for cpu in logical_cpu_list:
+                    if cpu.book >= 0:
+                        key = cpu.numa_node
+                        if key not in books_per_numa:
+                            books_per_numa[key] = set()
+                        books_per_numa[key].add(cpu.book)
+                use_book_aware_binding = any(
+                    len(books) > 1 for books in books_per_numa.values()
+                )
+                if use_book_aware_binding:
+                    # Use book-level binding
+                    num_topology_domains = len(
+                        set(
+                            (cpu.numa_node, cpu.book)
+                            for cpu in logical_cpu_list
+                            if cpu.book >= 0
+                        )
+                    )
 
         if not use_book_aware_binding:
             # For other architectures, check for multiple sockets per NUMA
@@ -255,22 +277,31 @@ class OMPProcessManager:
         # Now check if we have enough topology domains for binding
         # Note: s390x allows flexible TP to support varying requirements
         # Other architectures require strict TP <= topology domains
+        drawers_info = (
+            f", drawers={drawers_per_numa}" if use_drawer_aware_binding else ""
+        )
         books_info = f", books={books_per_numa}" if use_book_aware_binding else ""
         sockets_info = (
             f", sockets={sockets_per_numa}" if use_socket_aware_binding else ""
         )
 
         if not self.simulate_multi_node and num_topology_domains < local_world_size:
-            if cpu_arch == CpuArchEnum.S390X and use_book_aware_binding:
-                # s390x: Allow TP > books with round-robin, just warn
+            if cpu_arch == CpuArchEnum.S390X and (
+                use_drawer_aware_binding or use_book_aware_binding
+            ):
+                # s390x: Allow TP > topology domains with round-robin, just warn
+                topology_level = "drawers" if use_drawer_aware_binding else "books"
                 logger.warning(
-                    "tensor_parallel_size=%d exceeds available books (%d). "
-                    "Workers will be distributed across books which may cause "
+                    "tensor_parallel_size=%d exceeds available %s (%d). "
+                    "Workers will be distributed across %s which may cause "
                     "performance degradation due to shared resources. "
-                    "Topology: NUMA nodes=%s%s",
+                    "Topology: NUMA nodes=%s%s%s",
                     local_world_size,
+                    topology_level,
                     num_topology_domains,
+                    topology_level,
                     allowed_numa_nodes,
+                    drawers_info,
                     books_info,
                 )
             else:
@@ -279,6 +310,7 @@ class OMPProcessManager:
                     f"Not enough topology domains to bind {local_world_size} workers. "
                     f"Found {num_topology_domains} domain(s): "
                     f"NUMA nodes={allowed_numa_nodes}"
+                    f"{drawers_info}"
                     f"{books_info}"
                     f"{sockets_info}. "
                     f"Please try to bind threads manually or set "
@@ -290,7 +322,77 @@ class OMPProcessManager:
         reserved_cpu_list = []
         total_cpu_num = 0
 
-        if use_book_aware_binding:
+        if use_drawer_aware_binding:
+            # Group CPUs by (NUMA node, drawer) for maximum isolation
+            numa_drawer_pairs = sorted(
+                set(
+                    (cpu.numa_node, cpu.drawer)
+                    for cpu in logical_cpu_list
+                    if cpu.drawer >= 0
+                )
+            )
+
+            logger.info(
+                "Detected %d drawer(s) across %d NUMA node(s) - "
+                "using drawer-aware binding for maximum isolation",
+                len(numa_drawer_pairs),
+                len(allowed_numa_nodes),
+            )
+
+            # Warn if TP size doesn't match optimal topology (s390x specific)
+            if (
+                local_world_size < len(numa_drawer_pairs)
+                and not self.simulate_multi_node
+            ):
+                logger.warning(
+                    "tensor_parallel_size=%d is less than "
+                    "the number of drawers (%d). "
+                    "Some drawers will be unused. For optimal utilization, "
+                    "consider setting tensor_parallel_size=%d.",
+                    local_world_size,
+                    len(numa_drawer_pairs),
+                    len(numa_drawer_pairs),
+                )
+
+            for local_rank in range(self.local_world_size):
+                # s390x specific: Use round-robin distribution if TP > num_drawers
+                drawer_index = local_rank % len(numa_drawer_pairs)
+                selected_numa, selected_drawer = numa_drawer_pairs[drawer_index]
+                selected_logical_cpu_list = [
+                    x
+                    for x in logical_cpu_list
+                    if x.numa_node == selected_numa and x.drawer == selected_drawer
+                ]
+
+                # Collect physical cores in this (NUMA, drawer) pair
+                core_to_cpus_drawer: dict[int, list[int]] = {}
+                for cpu in selected_logical_cpu_list:
+                    if cpu.physical_core not in core_to_cpus_drawer:
+                        core_to_cpus_drawer[cpu.physical_core] = []
+                    core_to_cpus_drawer[cpu.physical_core].append(cpu.id)
+
+                # Sort cores and select CPUs
+                sorted_cores = sorted(core_to_cpus_drawer.keys())
+                total_cores = len(sorted_cores)
+
+                # Use all available cores for this worker
+                # (round-robin distribution already assigns workers to drawers)
+                cores_per_worker = total_cores
+
+                # Assign cores to this worker
+                cpu_list_of_rank = []
+                for core in sorted_cores[:cores_per_worker]:
+                    cpu_list_of_rank.extend(core_to_cpus_drawer[core])
+
+                cpu_lists_of_ranks.append(cpu_list_of_rank)
+                total_cpu_num += len(cpu_list_of_rank)
+
+                # Reserve last core if needed
+                if local_rank == 0 and total_cores > cores_per_worker:
+                    reserved_core = sorted_cores[-1]
+                    reserved_cpu_list.extend(core_to_cpus_drawer[reserved_core])
+
+        elif use_book_aware_binding:
             # Group CPUs by (NUMA node, book) instead of just NUMA node
             # Collect unique (numa_node, book) pairs
             numa_book_pairs = sorted(

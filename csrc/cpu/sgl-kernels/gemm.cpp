@@ -190,10 +190,258 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 };
 #endif
 
+#if defined(CPU_CAPABILITY_VXE)
+
+// VXE micro-kernel for GEMM: C[M x 8] += A[M x K] * B[K x 8]
+// B is in VNNI format [K/2, N, 2] where pairs are interleaved per column:
+// Memory layout: [col0_k0, col0_k1, col1_k0, col1_k1, ..., col7_k0, col7_k1]
+template <int M, typename scalar_t>
+inline void gemm_micro_vxe_Mx8(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
+    int64_t lda, int64_t ldc, int64_t K) {
+  
+  static_assert(M >= 1 && M <= 4, "M must be in [1,4] for VXE micro-kernel");
+  
+  constexpr int PREFETCH_SIZE_K = 4;
+  
+  // Helper macros for code generation
+  #define VXE_ROW_OP(OP) OP(0) OP(1) OP(2) OP(3)
+  #define VXE_IF_M(i) if constexpr (M > (i))
+  
+  // Define A row pointers
+  #define VXE_DECL_A(i) const scalar_t* a##i = A + (i) * lda;
+  VXE_ROW_OP(VXE_DECL_A)
+  #undef VXE_DECL_A
+  
+  // Define accumulators (2 vectors per row, each handles 4 float elements)
+  #define VXE_DECL_ACC(i) __vector float acc##i##_0, acc##i##_1;
+  VXE_ROW_OP(VXE_DECL_ACC)
+  #undef VXE_DECL_ACC
+  
+  // Initialize accumulators with bias
+  #define VXE_INIT_ACC(i)                                                \
+    VXE_IF_M(i) {                                                        \
+      if (bias != nullptr) {                                             \
+        acc##i##_0 = vec_xl((long long)0, const_cast<float*>(bias + 0)); \
+        acc##i##_1 = vec_xl((long long)0, const_cast<float*>(bias + 4)); \
+      } else {                                                           \
+        acc##i##_0 = vec_splats(0.0f);                                   \
+        acc##i##_1 = vec_splats(0.0f);                                   \
+      }                                                                  \
+    }
+  VXE_ROW_OP(VXE_INIT_ACC)
+  #undef VXE_INIT_ACC
+  
+  auto load_vnni_bf16_as_fp32 = [](const at::BFloat16* p, 
+                                    __vector float& b0_k0, __vector float& b1_k0,
+                                    __vector float& b0_k1, __vector float& b1_k1) {
+    __vector unsigned short raw0 = vec_xl((long long)0, (unsigned short*)p);
+    __vector unsigned short raw1 = vec_xl((long long)16, (unsigned short*)p);
+
+    const __vector unsigned char perm_even = {
+        0,1, 4,5, 8,9, 12,13, 16,17, 20,21, 24,25, 28,29};  // even positions
+    const __vector unsigned char perm_odd = {
+        2,3, 6,7, 10,11, 14,15, 18,19, 22,23, 26,27, 30,31};  // odd positions
+    
+    __vector unsigned short k0_all = vec_perm(raw0, raw1, perm_even);  // all k=0 values
+    __vector unsigned short k1_all = vec_perm(raw0, raw1, perm_odd);   // all k=1 values
+    
+    // Convert BF16 to FP32: BF16 occupies upper 16 bits on big-endian
+    __vector unsigned short zeros = vec_splat_u16(0);
+    __vector unsigned int k0_32_0 = (__vector unsigned int)vec_mergeh(zeros, k0_all);
+    __vector unsigned int k0_32_1 = (__vector unsigned int)vec_mergel(zeros, k0_all);
+    __vector unsigned int k1_32_0 = (__vector unsigned int)vec_mergeh(zeros, k1_all);
+    __vector unsigned int k1_32_1 = (__vector unsigned int)vec_mergel(zeros, k1_all);
+    
+    b0_k0 = (__vector float)k0_32_0;
+    b1_k0 = (__vector float)k0_32_1;
+    b0_k1 = (__vector float)k1_32_0;
+    b1_k1 = (__vector float)k1_32_1;
+  };
+  
+  // VNNI format: [K/2, 8, 2] - process K in pairs
+  const int64_t K2 = K / 2;
+  const scalar_t* b_ptr = B;
+  
+  // Main loop: process K dimension in pairs (VNNI format)
+  for (int64_t k = 0; k < K2; ++k) {
+    if (k + PREFETCH_SIZE_K < K2) {
+      __builtin_prefetch(b_ptr + PREFETCH_SIZE_K * 16, 0, 1);
+    }
+    
+    __vector float b0_k0, b1_k0, b0_k1, b1_k1;
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      load_vnni_bf16_as_fp32(reinterpret_cast<const at::BFloat16*>(b_ptr),
+                             b0_k0, b1_k0, b0_k1, b1_k1);
+    } else if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+      alignas(16) float tmp[16];
+      for (int i = 0; i < 16; ++i) tmp[i] = static_cast<float>(b_ptr[i]);
+      // Deinterleave
+      alignas(16) float k0[8], k1[8];
+      for (int i = 0; i < 8; ++i) {
+        k0[i] = tmp[i * 2];
+        k1[i] = tmp[i * 2 + 1];
+      }
+      b0_k0 = vec_xl((long long)0, k0);
+      b1_k0 = vec_xl((long long)0, k0 + 4);
+      b0_k1 = vec_xl((long long)0, k1);
+      b1_k1 = vec_xl((long long)0, k1 + 4);
+    } else {
+      // FP32: already deinterleaved
+      b0_k0 = vec_xl((long long)0, (float*)b_ptr);
+      b1_k0 = vec_xl((long long)0, (float*)(b_ptr + 4));
+      b0_k1 = vec_xl((long long)0, (float*)(b_ptr + 8));
+      b1_k1 = vec_xl((long long)0, (float*)(b_ptr + 12));
+    }
+    b_ptr += 16;  // Advance by 16 elements (8 cols × 2 K-pairs)
+    
+    #define VXE_STEP_K0(i)                                               \
+      VXE_IF_M(i) {                                                      \
+        float a_val = static_cast<float>(a##i[k * 2]);                   \
+        __vector float a_broad = vec_splats(a_val);                      \
+        acc##i##_0 = vec_madd(b0_k0, a_broad, acc##i##_0);               \
+        acc##i##_1 = vec_madd(b1_k0, a_broad, acc##i##_1);               \
+      }
+    VXE_ROW_OP(VXE_STEP_K0)
+    #undef VXE_STEP_K0
+    
+    #define VXE_STEP_K1(i)                                               \
+      VXE_IF_M(i) {                                                      \
+        float a_val = static_cast<float>(a##i[k * 2 + 1]);               \
+        __vector float a_broad = vec_splats(a_val);                      \
+        acc##i##_0 = vec_madd(b0_k1, a_broad, acc##i##_0);               \
+        acc##i##_1 = vec_madd(b1_k1, a_broad, acc##i##_1);               \
+      }
+    VXE_ROW_OP(VXE_STEP_K1)
+    #undef VXE_STEP_K1
+  }
+  
+  // Handle odd K tail (if K % 2 != 0)
+  if (K % 2 != 0) {
+    __vector float b0, b1;
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      __vector unsigned short raw = vec_xl((long long)0, (unsigned short*)b_ptr);
+      __vector unsigned short zeros = vec_splat_u16(0);
+      __vector unsigned int raw32_0 = (__vector unsigned int)vec_mergeh(zeros, raw);
+      __vector unsigned int raw32_1 = (__vector unsigned int)vec_mergel(zeros, raw);
+      b0 = (__vector float)raw32_0;
+      b1 = (__vector float)raw32_1;
+    } else {
+      alignas(16) float tmp[8];
+      for (int i = 0; i < 8; ++i) tmp[i] = static_cast<float>(b_ptr[i]);
+      b0 = vec_xl((long long)0, tmp);
+      b1 = vec_xl((long long)0, tmp + 4);
+    }
+    
+    #define VXE_TAIL(i)                                                  \
+      VXE_IF_M(i) {                                                      \
+        float a_val = static_cast<float>(a##i[K - 1]);                   \
+        __vector float a_broad = vec_splats(a_val);                      \
+        acc##i##_0 = vec_madd(b0, a_broad, acc##i##_0);                  \
+        acc##i##_1 = vec_madd(b1, a_broad, acc##i##_1);                  \
+      }
+    VXE_ROW_OP(VXE_TAIL)
+    #undef VXE_TAIL
+  }
+  
+  // Vectorized store: FP32 accumulator -> BF16/FP16 output
+  #define VXE_STORE_ACC(i)                                               \
+    VXE_IF_M(i) {                                                        \
+      if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {            \
+        __vector unsigned int i0 = (__vector unsigned int)acc##i##_0;    \
+        __vector unsigned int i1 = (__vector unsigned int)acc##i##_1;    \
+        __vector unsigned short packed = vec_pack(i0, i1);               \
+        vec_xst(packed, (long long)0, (unsigned short*)(C + (i) * ldc)); \
+      } else {                                                           \
+        alignas(16) float tmp[8];                                        \
+        vec_xst(acc##i##_0, (long long)0, tmp);                          \
+        vec_xst(acc##i##_1, (long long)0, tmp + 4);                      \
+        for (int n = 0; n < 8; ++n) {                                    \
+          C[(i) * ldc + n] = static_cast<scalar_t>(tmp[n]);              \
+        }                                                                \
+      }                                                                  \
+    }
+  VXE_ROW_OP(VXE_STORE_ACC)
+  #undef VXE_STORE_ACC
+  
+  #undef VXE_IF_M
+  #undef VXE_ROW_OP
+}
+
+// VXE tinygemm_kernel_nn specialization for BF16
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B, at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+    
+    static_assert(BLOCK_N % 8 == 0, "VXE kernel requires BLOCK_N to be multiple of 8");
+    constexpr int ROWS = BLOCK_M;
+    
+    // B is in VNNI format [K/2, N, 2], so for column block:
+    // B pointer offset = col_blk * (K/2 * 2) = col_blk * K elements in packed format
+    // But VNNI packing interleaves, so actual offset is col_blk * 2 (BF16 pairs)
+    const int64_t K2 = K / 2;
+    
+    // Process in blocks of 8 columns
+    for (int col_blk = 0; col_blk < BLOCK_N; col_blk += 8) {
+      // B offset in VNNI format: each column block is K elements arranged as [K/2][8][2]
+      // So offset = col_blk * K (total elements before this column block)
+      const at::BFloat16* b_col = B + col_blk * K;
+      at::BFloat16* c_col = C + col_blk;
+      const float* bias_col = has_bias ? (bias + col_blk) : nullptr;
+      
+      // Direct call using ROWS template parameter
+      gemm_micro_vxe_Mx8<ROWS, at::BFloat16>(
+          A, b_col, c_col, bias_col, lda, ldc, K);
+    }
+  }
+};
+
+// VXE tinygemm_kernel_nn specialization for FP16
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::Half, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::Half* __restrict__ A, const at::Half* __restrict__ B, at::Half* __restrict__ C,
+      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+    
+    static_assert(BLOCK_N % 8 == 0, "VXE kernel requires BLOCK_N to be multiple of 8");
+    constexpr int ROWS = BLOCK_M;
+    
+    // Process in blocks of 8 columns
+    for (int col_blk = 0; col_blk < BLOCK_N; col_blk += 8) {
+      const at::Half* b_col = B + col_blk * K;
+      at::Half* c_col = C + col_blk;
+      const float* bias_col = has_bias ? (bias + col_blk) : nullptr;
+      
+      gemm_micro_vxe_Mx8<ROWS, at::Half>(
+          A, b_col, c_col, bias_col, lda, ldc, K);
+    }
+  }
+};
+
+#endif  // CPU_CAPABILITY_VXE
+
+#if defined(CPU_CAPABILITY_AVX512)
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
     tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply(         \
         A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, \
         has_bias ? bias + nb_start : nullptr, K, lda, ldb, ldc);
+#elif defined(CPU_CAPABILITY_VXE)
+// VXE: B is in VNNI format, offset by nb_start * K
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
+    tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply(         \
+        A + mb_start * lda, B + nb_start * K, C + mb_start * ldc + nb_start, \
+        has_bias ? bias + nb_start : nullptr, K, lda, ldb, ldc);
+#else
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
+    tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply(         \
+        A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start,     \
+        has_bias ? bias + nb_start : nullptr, K, lda, nb_size, ldc);
+#endif
 
 template <typename scalar_t, bool has_bias>
 struct brgemm {
