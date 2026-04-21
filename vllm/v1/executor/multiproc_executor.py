@@ -577,6 +577,10 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        # Fix VLLM_DIST_IDENT for s390x multi-worker scenarios
+        if "VLLM_DIST_IDENT" in os.environ:
+            os.environ["VLLM_DIST_IDENT"] = f"{os.environ['VLLM_DIST_IDENT']}_{rank}"
+
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [

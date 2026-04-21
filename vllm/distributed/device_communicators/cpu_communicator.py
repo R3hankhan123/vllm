@@ -32,12 +32,14 @@ class CpuCommunicator(DeviceCommunicatorBase):
             (
                 current_platform.get_cpu_architecture() == CpuArchEnum.X86
                 or current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+                or current_platform.get_cpu_architecture() == CpuArchEnum.S390X
             )
             and hasattr(torch.ops._C, "init_shm_manager")
             and (unique_name.startswith("tp") or unique_name.startswith("pp"))
             and self._all_group_ranks_share_shm_group_name()
         ):
             self.dist_module = _CPUSHMDistributed(self)
+            logger.info("CPU SHM communicator enabled for group %s", unique_name)
         elif unique_name.startswith("tp") or unique_name.startswith("pp"):
             logger.info(
                 "CPU SHM communicator disabled for group %s: ranks do not share "
