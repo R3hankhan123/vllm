@@ -144,27 +144,38 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
 const static __vector signed short zero = vec_splats((signed short)0);
 
 FORCE_INLINE __vector float fp16_to_fp32_bits(__vector unsigned int x) {
+  // Optimized IEEE 754 FP16 to FP32 conversion using vector operations
+  // IEEE FP16: [sign:1][exp:5][mant:10] -> FP32: [sign:1][exp:8][mant:23]
+  
   const __vector unsigned int mask_sign = {0x8000, 0x8000, 0x8000, 0x8000};
   const __vector unsigned int mask_exp = {0x7C00, 0x7C00, 0x7C00, 0x7C00};
   const __vector unsigned int mask_mant = {0x03FF, 0x03FF, 0x03FF, 0x03FF};
-  const __vector unsigned int bias_adj = {112, 112, 112, 112};
-  const __vector unsigned int exp_max_fp16 = {0x1F, 0x1F, 0x1F,
-                                              0x1F};  // FP16 NaN/Inf exponent
-  const __vector unsigned int exp_max_fp32 = {0xFF, 0xFF, 0xFF,
-                                              0xFF};  // FP32 NaN/Inf exponent
+  const __vector unsigned int bias_adj = {112, 112, 112, 112};  // 127 - 15
+  const __vector unsigned int zero_v = {0, 0, 0, 0};
+  const __vector unsigned int exp_max_fp16 = {0x1F, 0x1F, 0x1F, 0x1F};
+  const __vector unsigned int fp32_inf = {0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000};
 
+  // Extract components
   __vector unsigned int s = (x & mask_sign) << 16;
   __vector unsigned int e = (x & mask_exp) >> 10;
   __vector unsigned int m = (x & mask_mant) << 13;
 
-  // Check for NaN/Inf: exponent = 0x1F in FP16
-  __vector __bool int is_nan_inf = vec_cmpeq(e, exp_max_fp16);
+  // Detect special cases
+  __vector __bool int is_zero = vec_cmpeq(e, zero_v);            // exp == 0: zero/subnormal
+  __vector __bool int is_special = vec_cmpeq(e, exp_max_fp16);   // exp == 0x1F: inf/nan
 
-  // Normal: adjust bias; NaN/Inf: set to 0xFF
-  __vector unsigned int e_normal = e + bias_adj;
-  e = vec_sel(e_normal, exp_max_fp32, is_nan_inf);
+  // Normal case: s | ((e + 112) << 23) | m
+  __vector unsigned int exp_shifted = (e + bias_adj) << 23;
+  __vector unsigned int normal = s | exp_shifted | m;
 
-  return (__vector float)(s | (e << 23) | m);
+  // Special case: s | 0x7F800000 | m (inf/nan preserves mantissa)
+  __vector unsigned int special = s | fp32_inf | m;
+
+  // Select result: zero -> s only, special -> special, else -> normal
+  __vector unsigned int result = vec_sel(normal, s, is_zero);
+  result = vec_sel(result, special, is_special);
+
+  return (__vector float)result;
 }
 
 FORCE_INLINE __vector unsigned int fp32_to_fp16_bits(__vector float f_in) {
