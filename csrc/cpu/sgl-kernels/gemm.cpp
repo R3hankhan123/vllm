@@ -235,31 +235,96 @@ inline void gemm_micro_vxe_Mx8(
   VXE_ROW_OP(VXE_INIT_ACC)
   #undef VXE_INIT_ACC
   
+  // Helper: Load and deinterleave VNNI BF16 pairs, convert to FP32
+  // Optimized for big-endian: BF16 at upper 16 bits of FP32
   auto load_vnni_bf16_as_fp32 = [](const at::BFloat16* p, 
                                     __vector float& b0_k0, __vector float& b1_k0,
                                     __vector float& b0_k1, __vector float& b1_k1) {
     __vector unsigned short raw0 = vec_xl((long long)0, (unsigned short*)p);
     __vector unsigned short raw1 = vec_xl((long long)16, (unsigned short*)p);
 
+    // Deinterleave using single permute operation
     const __vector unsigned char perm_even = {
-        0,1, 4,5, 8,9, 12,13, 16,17, 20,21, 24,25, 28,29};  // even positions
+        0,1, 4,5, 8,9, 12,13, 16,17, 20,21, 24,25, 28,29};
     const __vector unsigned char perm_odd = {
-        2,3, 6,7, 10,11, 14,15, 18,19, 22,23, 26,27, 30,31};  // odd positions
+        2,3, 6,7, 10,11, 14,15, 18,19, 22,23, 26,27, 30,31};
     
-    __vector unsigned short k0_all = vec_perm(raw0, raw1, perm_even);  // all k=0 values
-    __vector unsigned short k1_all = vec_perm(raw0, raw1, perm_odd);   // all k=1 values
+    __vector unsigned short k0_all = vec_perm(raw0, raw1, perm_even);
+    __vector unsigned short k1_all = vec_perm(raw0, raw1, perm_odd);
     
-    // Convert BF16 to FP32: BF16 occupies upper 16 bits on big-endian
+    // Convert BF16 to FP32: BF16 at upper 16 bits on big-endian s390x
+    // Use vec_mergeh/vec_mergel with swapped operands for efficiency
     __vector unsigned short zeros = vec_splat_u16(0);
-    __vector unsigned int k0_32_0 = (__vector unsigned int)vec_mergeh(zeros, k0_all);
-    __vector unsigned int k0_32_1 = (__vector unsigned int)vec_mergel(zeros, k0_all);
-    __vector unsigned int k1_32_0 = (__vector unsigned int)vec_mergeh(zeros, k1_all);
-    __vector unsigned int k1_32_1 = (__vector unsigned int)vec_mergel(zeros, k1_all);
+    b0_k0 = (__vector float)vec_mergeh(zeros, k0_all);
+    b1_k0 = (__vector float)vec_mergel(zeros, k0_all);
+    b0_k1 = (__vector float)vec_mergeh(zeros, k1_all);
+    b1_k1 = (__vector float)vec_mergel(zeros, k1_all);
+  };
+  
+  // Helper: Load and deinterleave VNNI FP16 pairs, convert to FP32 (vectorized)
+  auto load_vnni_fp16_as_fp32 = [](const c10::Half* p,
+                                    __vector float& b0_k0, __vector float& b1_k0,
+                                    __vector float& b0_k1, __vector float& b1_k1) {
+    // Load 16 FP16 values (interleaved VNNI format)
+    __vector unsigned short raw0 = vec_xl((long long)0, (unsigned short*)p);
+    __vector unsigned short raw1 = vec_xl((long long)16, (unsigned short*)p);
     
-    b0_k0 = (__vector float)k0_32_0;
-    b1_k0 = (__vector float)k0_32_1;
-    b0_k1 = (__vector float)k1_32_0;
-    b1_k1 = (__vector float)k1_32_1;
+    // Deinterleave using optimized permute
+    const __vector unsigned char perm_even = {
+        0,1, 4,5, 8,9, 12,13, 16,17, 20,21, 24,25, 28,29};
+    const __vector unsigned char perm_odd = {
+        2,3, 6,7, 10,11, 14,15, 18,19, 22,23, 26,27, 30,31};
+    
+    __vector unsigned short k0_all = vec_perm(raw0, raw1, perm_even);
+    __vector unsigned short k1_all = vec_perm(raw0, raw1, perm_odd);
+    
+    // Convert FP16 to FP32 using vectorized operations
+    // Split into high/low 4 elements for processing
+    __vector unsigned short zeros = vec_splat_u16(0);
+    
+    // k0: Expand to 32-bit words
+    __vector unsigned int k0_hi = (__vector unsigned int)vec_mergeh(k0_all, zeros);
+    __vector unsigned int k0_lo = (__vector unsigned int)vec_mergel(k0_all, zeros);
+    __vector unsigned int k1_hi = (__vector unsigned int)vec_mergeh(k1_all, zeros);
+    __vector unsigned int k1_lo = (__vector unsigned int)vec_mergel(k1_all, zeros);
+    
+    // IEEE 754 FP16: [sign:1][exp:5][mant:10] -> FP32: [sign:1][exp:8][mant:23]
+    // Strategy: shift, mask, adjust exponent, combine
+    const __vector unsigned int sign_mask = vec_splats(0x8000u);
+    const __vector unsigned int exp_mask = vec_splats(0x7C00u);
+    const __vector unsigned int mant_mask = vec_splats(0x03FFu);
+    const __vector unsigned int exp_adjust = vec_splats(112u);  // FP32_bias - FP16_bias = 127 - 15
+    const __vector unsigned int fp32_inf = vec_splats(0x7F800000u);
+    
+    auto convert_fp16_vec = [](__vector unsigned int h16) -> __vector float {
+      // Extract components
+      __vector unsigned int sign = vec_sl(vec_and(h16, vec_splats(0x8000u)), vec_splats(16u));
+      __vector unsigned int exp = vec_sr(vec_and(h16, vec_splats(0x7C00u)), vec_splats(10u));
+      __vector unsigned int mant = vec_sl(vec_and(h16, vec_splats(0x03FFu)), vec_splats(13u));
+      
+      // Check for zero/subnormal (exp == 0)
+      __vector bool int is_zero = vec_cmpeq(exp, vec_splats(0u));
+      // Check for inf/nan (exp == 0x1F)
+      __vector bool int is_special = vec_cmpeq(exp, vec_splats(0x1Fu));
+      
+      // Normal case: sign | ((exp + 112) << 23) | mant
+      __vector unsigned int exp_shifted = vec_sl(vec_add(exp, vec_splats(112u)), vec_splats(23u));
+      __vector unsigned int normal = vec_or(vec_or(sign, exp_shifted), mant);
+      
+      // Special case: sign | 0x7F800000 | mant (inf/nan)
+      __vector unsigned int special = vec_or(vec_or(sign, vec_splats(0x7F800000u)), mant);
+      
+      // Select: zero -> sign, special -> special, else -> normal
+      __vector unsigned int result = vec_sel(normal, sign, is_zero);
+      result = vec_sel(result, special, is_special);
+      
+      return (__vector float)result;
+    };
+    
+    b0_k0 = convert_fp16_vec(k0_hi);
+    b1_k0 = convert_fp16_vec(k0_lo);
+    b0_k1 = convert_fp16_vec(k1_hi);
+    b1_k1 = convert_fp16_vec(k1_lo);
   };
   
   // VNNI format: [K/2, 8, 2] - process K in pairs
@@ -268,8 +333,9 @@ inline void gemm_micro_vxe_Mx8(
   
   // Main loop: process K dimension in pairs (VNNI format)
   for (int64_t k = 0; k < K2; ++k) {
-    if (k + PREFETCH_SIZE_K < K2) {
-      __builtin_prefetch(b_ptr + PREFETCH_SIZE_K * 16, 0, 1);
+    // Prefetch further ahead for better memory latency hiding
+    if (k + PREFETCH_SIZE_K < K2) [[likely]] {
+      __builtin_prefetch(b_ptr + PREFETCH_SIZE_K * 16, 0, 3);  // Temporal locality
     }
     
     __vector float b0_k0, b1_k0, b0_k1, b1_k1;
@@ -277,18 +343,8 @@ inline void gemm_micro_vxe_Mx8(
       load_vnni_bf16_as_fp32(reinterpret_cast<const at::BFloat16*>(b_ptr),
                              b0_k0, b1_k0, b0_k1, b1_k1);
     } else if constexpr (std::is_same_v<scalar_t, c10::Half>) {
-      alignas(16) float tmp[16];
-      for (int i = 0; i < 16; ++i) tmp[i] = static_cast<float>(b_ptr[i]);
-      // Deinterleave
-      alignas(16) float k0[8], k1[8];
-      for (int i = 0; i < 8; ++i) {
-        k0[i] = tmp[i * 2];
-        k1[i] = tmp[i * 2 + 1];
-      }
-      b0_k0 = vec_xl((long long)0, k0);
-      b1_k0 = vec_xl((long long)0, k0 + 4);
-      b0_k1 = vec_xl((long long)0, k1);
-      b1_k1 = vec_xl((long long)0, k1 + 4);
+      load_vnni_fp16_as_fp32(reinterpret_cast<const c10::Half*>(b_ptr),
+                             b0_k0, b1_k0, b0_k1, b1_k1);
     } else {
       // FP32: already deinterleaved
       b0_k0 = vec_xl((long long)0, (float*)b_ptr);
@@ -320,20 +376,39 @@ inline void gemm_micro_vxe_Mx8(
   }
   
   // Handle odd K tail (if K % 2 != 0)
-  if (K % 2 != 0) {
+  if (K % 2 != 0) [[unlikely]] {
     __vector float b0, b1;
     if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
       __vector unsigned short raw = vec_xl((long long)0, (unsigned short*)b_ptr);
       __vector unsigned short zeros = vec_splat_u16(0);
-      __vector unsigned int raw32_0 = (__vector unsigned int)vec_mergeh(zeros, raw);
-      __vector unsigned int raw32_1 = (__vector unsigned int)vec_mergel(zeros, raw);
-      b0 = (__vector float)raw32_0;
-      b1 = (__vector float)raw32_1;
+      b0 = (__vector float)vec_mergeh(zeros, raw);
+      b1 = (__vector float)vec_mergel(zeros, raw);
+    } else if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+      // Vectorized FP16 conversion for tail
+      __vector unsigned short fp16_vec = vec_xl((long long)0, (unsigned short*)b_ptr);
+      __vector unsigned short zeros = vec_splat_u16(0);
+      __vector unsigned int hi = (__vector unsigned int)vec_mergeh(fp16_vec, zeros);
+      __vector unsigned int lo = (__vector unsigned int)vec_mergel(fp16_vec, zeros);
+      
+      auto convert_fp16_tail = [](__vector unsigned int h16) -> __vector float {
+        __vector unsigned int sign = vec_sl(vec_and(h16, vec_splats(0x8000u)), vec_splats(16u));
+        __vector unsigned int exp = vec_sr(vec_and(h16, vec_splats(0x7C00u)), vec_splats(10u));
+        __vector unsigned int mant = vec_sl(vec_and(h16, vec_splats(0x03FFu)), vec_splats(13u));
+        __vector bool int is_zero = vec_cmpeq(exp, vec_splats(0u));
+        __vector bool int is_special = vec_cmpeq(exp, vec_splats(0x1Fu));
+        __vector unsigned int exp_shifted = vec_sl(vec_add(exp, vec_splats(112u)), vec_splats(23u));
+        __vector unsigned int normal = vec_or(vec_or(sign, exp_shifted), mant);
+        __vector unsigned int special = vec_or(vec_or(sign, vec_splats(0x7F800000u)), mant);
+        __vector unsigned int result = vec_sel(normal, sign, is_zero);
+        return (__vector float)vec_sel(result, special, is_special);
+      };
+      
+      b0 = convert_fp16_tail(hi);
+      b1 = convert_fp16_tail(lo);
     } else {
-      alignas(16) float tmp[8];
-      for (int i = 0; i < 8; ++i) tmp[i] = static_cast<float>(b_ptr[i]);
-      b0 = vec_xl((long long)0, tmp);
-      b1 = vec_xl((long long)0, tmp + 4);
+      // FP32: direct load
+      b0 = vec_xl((long long)0, (float*)b_ptr);
+      b1 = vec_xl((long long)0, (float*)(b_ptr + 4));
     }
     
     #define VXE_TAIL(i)                                                  \
