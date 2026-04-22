@@ -608,8 +608,8 @@ void weight_packed_linear_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
-  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>);
+  // Use VXE kernels for BF16/FP16 when M <= 4, otherwise use brgemm
+  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16> && !std::is_same_v<scalar_t, at::Half>);
 
   // l2 cache block for n
   int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
