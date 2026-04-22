@@ -49,21 +49,41 @@ template <>
 FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
                                                 __vector float& b0,
                                                 __vector float& b1) {
-  alignas(16) float tmp[8];
-
-  // Manual unroll / conversion
-  tmp[0] = static_cast<float>(p[0]);
-  tmp[1] = static_cast<float>(p[1]);
-  tmp[2] = static_cast<float>(p[2]);
-  tmp[3] = static_cast<float>(p[3]);
-  tmp[4] = static_cast<float>(p[4]);
-  tmp[5] = static_cast<float>(p[5]);
-  tmp[6] = static_cast<float>(p[6]);
-  tmp[7] = static_cast<float>(p[7]);
-
-  // Explicit arguments for intrinsic: (long long offset, float* ptr)
-  b0 = vec_xl((long long)0, (float*)tmp);
-  b1 = vec_xl((long long)0, (float*)(tmp + 4));
+  // IEEE FP16 to FP32 conversion - vectorized for maximum performance
+  // Note: s390x VXE lacks direct FP16 hardware conversion, use vector bit ops
+  __vector unsigned short fp16_vec = vec_xl((long long)0, (unsigned short*)p);
+  __vector unsigned short zeros = vec_splat_u16(0);
+  
+  // Expand to 32-bit words (two halves)
+  __vector unsigned int hi = (__vector unsigned int)vec_mergeh(fp16_vec, zeros);
+  __vector unsigned int lo = (__vector unsigned int)vec_mergel(fp16_vec, zeros);
+  
+  // IEEE 754: FP16 [sign:1][exp:5][mant:10] -> FP32 [sign:1][exp:8][mant:23]
+  auto convert_fp16_vec = [](__vector unsigned int h16) -> __vector float {
+    // Extract components using vector operations
+    __vector unsigned int sign = vec_sl(vec_and(h16, vec_splats(0x8000u)), vec_splats(16u));
+    __vector unsigned int exp = vec_sr(vec_and(h16, vec_splats(0x7C00u)), vec_splats(10u));
+    __vector unsigned int mant = vec_sl(vec_and(h16, vec_splats(0x03FFu)), vec_splats(13u));
+    
+    // Detect special cases: zero/subnormal (exp==0), inf/nan (exp==0x1F)
+    __vector bool int is_zero = vec_cmpeq(exp, vec_splats(0u));
+    __vector bool int is_special = vec_cmpeq(exp, vec_splats(0x1Fu));
+    
+    // Normal case: sign | ((exp + 112) << 23) | mant\n    __vector unsigned int exp_shifted = vec_sl(vec_add(exp, vec_splats(112u)), vec_splats(23u));
+    __vector unsigned int normal = vec_or(vec_or(sign, exp_shifted), mant);
+    
+    // Special cases: zero -> sign only, inf/nan -> sign | 0x7F800000 | mant
+    __vector unsigned int special = vec_or(vec_or(sign, vec_splats(0x7F800000u)), mant);
+    
+    // Vector select: zero ? sign : (special ? special : normal)
+    __vector unsigned int result = vec_sel(normal, sign, is_zero);
+    result = vec_sel(result, special, is_special);
+    
+    return (__vector float)result;
+  };
+  
+  b0 = convert_fp16_vec(hi);
+  b1 = convert_fp16_vec(lo);
 }
 
 template <int32_t M, typename kv_cache_t>
