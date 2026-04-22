@@ -69,7 +69,8 @@ FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
     __vector bool int is_zero = vec_cmpeq(exp, vec_splats(0u));
     __vector bool int is_special = vec_cmpeq(exp, vec_splats(0x1Fu));
     
-    // Normal case: sign | ((exp + 112) << 23) | mant\n    __vector unsigned int exp_shifted = vec_sl(vec_add(exp, vec_splats(112u)), vec_splats(23u));
+    // Normal case: sign | ((exp + 112) << 23) | mant
+    __vector unsigned int exp_shifted = vec_sl(vec_add(exp, vec_splats(112u)), vec_splats(23u));
     __vector unsigned int normal = vec_or(vec_or(sign, exp_shifted), mant);
     
     // Special cases: zero -> sign only, inf/nan -> sign | 0x7F800000 | mant
