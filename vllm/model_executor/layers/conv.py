@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.ir.ops import conv2d, fused_conv2d_bias
 from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
@@ -131,15 +132,26 @@ class Conv2dLayer(ConvLayerBase):
 
     def _forward_conv(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
-        x = F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
+        if self.bias is not None:
+            x = fused_conv2d_bias(
+                x,
+                self.weight,
+                self.bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        else:
+            x = conv2d(
+                x,
+                self.weight,
+                None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
         return x
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,7 +163,7 @@ class Conv2dLayer(ConvLayerBase):
             return self._forward_conv(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # By default, we use CUDNN's convolution ops with optimization.
+        # By default, we use CUDNN's convolution ops with optimization via vLLM IR.
         return self._forward_conv(x)
 
 
