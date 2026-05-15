@@ -1,6 +1,6 @@
 
-#ifndef CPU_TYPES_VXE_HPP
-#define CPU_TYPES_VXE_HPP
+#ifndef CPU_TYPES_S390X_HPP
+#define CPU_TYPES_S390X_HPP
 
 #include <vecintrin.h>
 #include <cmath>
@@ -320,13 +320,15 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   float reduce_sum() const {
-    AliasReg ar;
-    ar.reg = reg;
-    float result = 0;
-    unroll_loop<int, VEC_ELEM_NUM>(
-        [&result, &ar](int i) { result += ar.values[i]; });
-
-    return result;
+    __vector float s = vec_add(reg.val[0], reg.val[1]);
+    s = vec_add(s, vec_sld(s, s, 8));
+    s = vec_add(s, vec_sld(s, s, 4));
+    union {
+      __vector float v;
+      float f[4];
+    } u;
+    u.v = s;
+    return u.f[0];
   }
 
   FP32Vec8 exp() const {
@@ -380,44 +382,28 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   FP32Vec8 tanh() const {
-    // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
     const __vector float one = vec_splats(1.0f);
     const __vector float two = vec_splats(2.0f);
-    const __vector float zero = vec_splats(0.0f);
-    const __vector float sat =
-        vec_splats(9.0f);  // beyond this, tanh(x) ~ sign(x)
+    const __vector float zero_v = vec_splats(0.0f);
+    const __vector float sat = vec_splats(9.0f);
+
+    f32x4x2_t two_x;
+    two_x.val[0] = vec_mul(reg.val[0], two);
+    two_x.val[1] = vec_mul(reg.val[1], two);
+
+    FP32Vec8 e2x = FP32Vec8(two_x).exp();
 
     f32x4x2_t out;
-
     for (int i = 0; i < 2; i++) {
       __vector float x = reg.val[i];
       __vector float ax = vec_abs(x);
-
-      // sign(x): +1 or -1
-      __vector float sign = vec_sel(vec_splats(-1.0f), one, vec_cmpgt(x, zero));
-
-      // saturation mask: |x| > sat
+      __vector float sign =
+          vec_sel(vec_splats(-1.0f), one, vec_cmpgt(x, zero_v));
       __vector __bool int saturated = vec_cmpgt(ax, sat);
 
-      // 2x
-      __vector float two_x = vec_mul(x, two);
-
-      // Build a temporary FP32Vec8 with both lanes = 2x, reuse exp()
-      f32x4x2_t tmp;
-      tmp.val[0] = two_x;
-      tmp.val[1] = two_x;
-      FP32Vec8 exp_2x_vec(tmp);
-
-      FP32Vec8 e2x = exp_2x_vec.exp();
       __vector float e = e2x.reg.val[i];
+      __vector float t = vec_div(vec_sub(e, one), vec_add(e, one));
 
-      // tanh(x) = (e - 1) / (e + 1)
-      __vector float num = vec_sub(e, one);
-      __vector float den = vec_add(e, one);
-
-      __vector float t = vec_div(num, den);
-
-      // For large |x|, clamp to sign(x)
       out.val[i] = vec_sel(t, sign, saturated);
     }
 
@@ -425,70 +411,42 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   FP32Vec8 er() const {
-    // A&S 7.1.26 approximation:
-    // erf(x) = sign(x) * (1 - ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t *
-    // exp(-x^2)) t = 1 / (1 + p*|x|),  p = 0.3275911
-
     const __vector float one = vec_splats(1.0f);
-    const __vector float zero = vec_splats(0.0f);
+    const __vector float zero_v = vec_splats(0.0f);
     const __vector float p = vec_splats(0.3275911f);
-
-    // Polynomial coeffs
     const __vector float a1 = vec_splats(0.254829592f);
     const __vector float a2 = vec_splats(-0.284496736f);
     const __vector float a3 = vec_splats(1.421413741f);
     const __vector float a4 = vec_splats(-1.453152027f);
     const __vector float a5 = vec_splats(1.061405429f);
-
-    // Threshold where erf(x) ~ sign(x)
     const __vector float sat = vec_splats(6.0f);
 
-    f32x4x2_t out;
+    f32x4x2_t neg_x2;
+    neg_x2.val[0] = vec_neg(vec_mul(reg.val[0], reg.val[0]));
+    neg_x2.val[1] = vec_neg(vec_mul(reg.val[1], reg.val[1]));
+    FP32Vec8 e = FP32Vec8(neg_x2).exp();
 
+    f32x4x2_t out;
     for (int lane = 0; lane < 2; lane++) {
       __vector float x = reg.val[lane];
       __vector float ax = vec_abs(x);
-
-      // sign(x)
-      __vector float sign = vec_sel(vec_splats(-1.0f), one, vec_cmpgt(x, zero));
-
-      // |x| > 6 → erf(x) = ±1
+      __vector float sign =
+          vec_sel(vec_splats(-1.0f), one, vec_cmpgt(x, zero_v));
       __vector __bool int saturated = vec_cmpgt(ax, sat);
 
-      // t = 1 / (1 + p * |x|)
-      __vector float t = vec_madd(p, ax, one);
-      t = vec_div(one, t);
+      __vector float t = vec_div(one, vec_madd(p, ax, one));
 
-      // poly = a5
       __vector float poly = a5;
       poly = vec_madd(poly, t, a4);
       poly = vec_madd(poly, t, a3);
       poly = vec_madd(poly, t, a2);
       poly = vec_madd(poly, t, a1);
-
-      // full polynomial: poly = poly * t
       poly = vec_mul(poly, t);
 
-      // Compute exp(-x^2)
-      __vector float x2 = vec_mul(x, x);
-      __vector float neg_x2 = vec_neg(x2);
-
-      f32x4x2_t tmp;
-      tmp.val[0] = neg_x2;
-      tmp.val[1] = neg_x2;
-      FP32Vec8 exp_neg_x2(tmp);
-
-      FP32Vec8 e = exp_neg_x2.exp();
-      __vector float ex = e.reg.val[lane];
-
-      // erf(x) = sign * (1 - poly * exp(-x^2))
-      __vector float term = vec_mul(poly, ex);
-      __vector float y = vec_sub(one, term);
+      __vector float y = vec_sub(one, vec_mul(poly, e.reg.val[lane]));
       y = vec_mul(y, sign);
 
-      // saturated → ±1
-      __vector float sat_val = vec_mul(sign, one);
-      out.val[lane] = vec_sel(y, sat_val, saturated);
+      out.val[lane] = vec_sel(y, sign, saturated);
     }
 
     return FP32Vec8(out);
@@ -561,26 +519,15 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
     return x_vec * half_vec * (one_vec + erf_x);
   }
 
-  // Elementwise reciprocal: 1/x (scalar per lane, for correctness)
   FP32Vec8 rcp() const {
-    AliasReg in, out;
-    in.reg = reg;
-
-    for (int i = 0; i < VEC_ELEM_NUM; ++i) {
-      out.values[i] = 1.0f / in.values[i];
-    }
-    return FP32Vec8(out.reg);
+    const __vector float one_v = vec_splats(1.0f);
+    return FP32Vec8({vec_div(one_v, reg.val[0]), vec_div(one_v, reg.val[1])});
   }
 
-  // Elementwise rsqrt(x) = 1 / sqrt(x) (scalar per lane, for correctness)
   FP32Vec8 rsqrt() const {
-    AliasReg in, out;
-    in.reg = reg;
-
-    for (int i = 0; i < VEC_ELEM_NUM; ++i) {
-      out.values[i] = 1.0f / std::sqrt(in.values[i]);
-    }
-    return FP32Vec8(out.reg);
+    const __vector float one_v = vec_splats(1.0f);
+    return FP32Vec8({vec_div(one_v, vec_sqrt(reg.val[0])),
+                     vec_div(one_v, vec_sqrt(reg.val[1]))});
   }
 
   FP32Vec8 operator*(const FP32Vec8& b) const {
@@ -671,19 +618,13 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   }
 
   explicit FP32Vec16(const FP16Vec16& v) {
-    __vector unsigned int raw_hi_0 =
-        (__vector unsigned int)vec_unpackh(v.reg.val[0]);
-    __vector unsigned int raw_lo_0 =
-        (__vector unsigned int)vec_unpackl(v.reg.val[0]);
-    reg.val[0] = fp16_to_fp32_bits(raw_hi_0);
-    reg.val[1] = fp16_to_fp32_bits(raw_lo_0);
+    __vector unsigned short raw_u0 = (__vector unsigned short)v.reg.val[0];
+    __vector unsigned short raw_u1 = (__vector unsigned short)v.reg.val[1];
 
-    __vector unsigned int raw_hi_1 =
-        (__vector unsigned int)vec_unpackh(v.reg.val[1]);
-    __vector unsigned int raw_lo_1 =
-        (__vector unsigned int)vec_unpackl(v.reg.val[1]);
-    reg.val[2] = fp16_to_fp32_bits(raw_hi_1);
-    reg.val[3] = fp16_to_fp32_bits(raw_lo_1);
+    reg.val[0] = fp16_to_fp32_bits((__vector unsigned int)vec_unpackh(raw_u0));
+    reg.val[1] = fp16_to_fp32_bits((__vector unsigned int)vec_unpackl(raw_u0));
+    reg.val[2] = fp16_to_fp32_bits((__vector unsigned int)vec_unpackh(raw_u1));
+    reg.val[3] = fp16_to_fp32_bits((__vector unsigned int)vec_unpackl(raw_u1));
   }
 
   explicit FP32Vec16(const BF16Vec8& v) : FP32Vec16(FP32Vec8(v)) {}
@@ -721,13 +662,16 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   }
 
   float reduce_sum() const {
-    AliasReg ar;
-    ar.reg = reg;
-    float result = 0;
-    unroll_loop<int, VEC_ELEM_NUM>(
-        [&result, &ar](int i) { result += ar.values[i]; });
-
-    return result;
+    __vector float s = vec_add(vec_add(reg.val[0], reg.val[2]),
+                               vec_add(reg.val[1], reg.val[3]));
+    s = vec_add(s, vec_sld(s, s, 8));
+    s = vec_add(s, vec_sld(s, s, 4));
+    union {
+      __vector float v;
+      float f[4];
+    } u;
+    u.v = s;
+    return u.f[0];
   }
 
   template <int group_size>
@@ -752,13 +696,16 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   }
 
   float reduce_max() const {
-    AliasReg ar;
-    ar.reg = reg;
-    float result = ar.values[0];
-    unroll_loop<int, VEC_ELEM_NUM>([&result, &ar](int i) {
-      if (ar.values[i] > result) result = ar.values[i];
-    });
-    return result;
+    __vector float m = vec_max(vec_max(reg.val[0], reg.val[2]),
+                               vec_max(reg.val[1], reg.val[3]));
+    m = vec_max(m, vec_sld(m, m, 8));
+    m = vec_max(m, vec_sld(m, m, 4));
+    union {
+      __vector float v;
+      float f[4];
+    } u;
+    u.v = m;
+    return u.f[0];
   }
 
   void save(float* ptr) const {
@@ -1054,64 +1001,64 @@ inline FP16Vec16::FP16Vec16(const FP32Vec16& v) {
 FORCE_INLINE void softmax_fp32vec8(float* output, const float* input, int n) {
   if (n <= 0) return;
 
-  // ---------- Pass 1: find max ----------
-  float max_val = -std::numeric_limits<float>::infinity();
+  // Pass 1: find max using vector max reduction
+  __vector float max_v0 = vec_splats(-std::numeric_limits<float>::infinity());
+  __vector float max_v1 = max_v0;
   int i = 0;
 
-  for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-    FP32Vec8 v(input + i);
-    FP32Vec8::AliasReg ar;
-    ar.reg = v.reg;
-    for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-      if (ar.values[j] > max_val) max_val = ar.values[j];
-    }
+  for (; i + 8 <= n; i += 8) {
+    max_v0 = vec_max(max_v0, vec_xl(0, input + i));
+    max_v1 = vec_max(max_v1, vec_xl(16, input + i));
   }
+  __vector float mx = vec_max(max_v0, max_v1);
+  mx = vec_max(mx, vec_sld(mx, mx, 8));
+  mx = vec_max(mx, vec_sld(mx, mx, 4));
+  union {
+    __vector float v;
+    float f[4];
+  } mu;
+  mu.v = mx;
+  float max_val = mu.f[0];
   for (; i < n; ++i) {
     if (input[i] > max_val) max_val = input[i];
   }
 
-  // ---------- Pass 2: compute exp(x - max) and sum ----------
+  // Pass 2: exp(x - max) and sum
+  __vector float max_bcast = vec_splats(max_val);
+  __vector float sum_v0 = vec_splats(0.0f);
+  __vector float sum_v1 = sum_v0;
   float sum = 0.0f;
   i = 0;
 
-  for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-    float tmp[FP32Vec8::VEC_ELEM_NUM];
-    for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-      tmp[j] = input[i + j] - max_val;
-    }
-
-    FP32Vec8 v(tmp);
-    FP32Vec8 e = v.exp();
-
-    FP32Vec8::AliasReg ar;
-    ar.reg = e.reg;
-    for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-      output[i + j] = ar.values[j];
-      sum += ar.values[j];
-    }
+  for (; i + 8 <= n; i += 8) {
+    f32x4x2_t shifted = {vec_sub(vec_xl(0, input + i), max_bcast),
+                         vec_sub(vec_xl(16, input + i), max_bcast)};
+    FP32Vec8 e = FP32Vec8(shifted).exp();
+    e.save(output + i);
+    sum_v0 = vec_add(sum_v0, e.reg.val[0]);
+    sum_v1 = vec_add(sum_v1, e.reg.val[1]);
   }
+  __vector float sv = vec_add(sum_v0, sum_v1);
+  sv = vec_add(sv, vec_sld(sv, sv, 8));
+  sv = vec_add(sv, vec_sld(sv, sv, 4));
+  mu.v = sv;
+  sum = mu.f[0];
 
-  // Tail
   for (; i < n; ++i) {
-    float x = input[i] - max_val;
-    float ex = std::exp(x);  // scalar tail
+    float ex = std::exp(input[i] - max_val);
     output[i] = ex;
     sum += ex;
   }
 
-  // ---------- Pass 3: normalize ----------
-  float inv_sum = 1.0f / sum;
+  // Pass 3: normalize
+  __vector float inv_sum_vec = vec_splats(1.0f / sum);
   i = 0;
 
-  for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-    float tmp[FP32Vec8::VEC_ELEM_NUM];
-    for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-      tmp[j] = output[i + j] * inv_sum;
-    }
-    FP32Vec8 v(tmp);
-    v.save(output + i);
+  for (; i + 8 <= n; i += 8) {
+    vec_xst(vec_mul(vec_xl(0, output + i), inv_sum_vec), 0, output + i);
+    vec_xst(vec_mul(vec_xl(16, output + i), inv_sum_vec), 16, output + i);
   }
-
+  float inv_sum = 1.0f / sum;
   for (; i < n; ++i) {
     output[i] *= inv_sum;
   }
@@ -1126,65 +1073,55 @@ FORCE_INLINE void rmsnorm_fp32vec8(float* output, const float* input,
                                    const float* weight, int n, float eps) {
   if (n <= 0) return;
 
-  // ---------- Pass 1: compute sum of squares ----------
-  float sum_sq = 0.0f;
+  // Pass 1: sum of squares using FMA accumulation
+  __vector float acc0 = vec_splats(0.0f);
+  __vector float acc1 = vec_splats(0.0f);
   int i = 0;
 
-  for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-    FP32Vec8 x_vec(input + i);
-
-    FP32Vec8 sq = x_vec * x_vec;
-
-    FP32Vec8::AliasReg ar;
-    ar.reg = sq.reg;
-    for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-      sum_sq += ar.values[j];
-    }
+  for (; i + 8 <= n; i += 8) {
+    __vector float x0 = vec_xl(0, input + i);
+    __vector float x1 = vec_xl(16, input + i);
+    acc0 = vec_madd(x0, x0, acc0);
+    acc1 = vec_madd(x1, x1, acc1);
   }
-
-  // Tail
+  __vector float s = vec_add(acc0, acc1);
+  s = vec_add(s, vec_sld(s, s, 8));
+  s = vec_add(s, vec_sld(s, s, 4));
+  union {
+    __vector float v;
+    float f[4];
+  } su;
+  su.v = s;
+  float sum_sq = su.f[0];
   for (; i < n; ++i) {
-    float v = input[i];
-    sum_sq += v * v;
+    sum_sq += input[i] * input[i];
   }
 
-  float mean_sq = sum_sq / static_cast<float>(n);
-  float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
+  float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
 
-  // ---------- Pass 2: scale (and apply weight if given) ----------
-  const float inv_rms_f = inv_rms;
+  // Pass 2: scale (and apply weight if given)
+  __vector float scale_v = vec_splats(inv_rms);
   i = 0;
 
   if (weight) {
-    // with gamma
-    for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-      FP32Vec8 x_vec(input + i);
-
-      float wtmp[FP32Vec8::VEC_ELEM_NUM];
-      for (int j = 0; j < FP32Vec8::VEC_ELEM_NUM; ++j) {
-        wtmp[j] = weight[i + j];
-      }
-      FP32Vec8 w_vec(wtmp);
-
-      FP32Vec8 scale_vec(inv_rms_f);
-      FP32Vec8 y = x_vec * scale_vec * w_vec;
-      y.save(output + i);
+    for (; i + 8 <= n; i += 8) {
+      __vector float x0 = vec_xl(0, input + i);
+      __vector float x1 = vec_xl(16, input + i);
+      __vector float w0 = vec_xl(0, weight + i);
+      __vector float w1 = vec_xl(16, weight + i);
+      vec_xst(vec_mul(vec_mul(x0, scale_v), w0), 0, output + i);
+      vec_xst(vec_mul(vec_mul(x1, scale_v), w1), 16, output + i);
     }
-
     for (; i < n; ++i) {
-      output[i] = input[i] * inv_rms_f * weight[i];
+      output[i] = input[i] * inv_rms * weight[i];
     }
   } else {
-    // without gamma
-    for (; i + FP32Vec8::VEC_ELEM_NUM <= n; i += FP32Vec8::VEC_ELEM_NUM) {
-      FP32Vec8 x_vec(input + i);
-      FP32Vec8 scale_vec(inv_rms_f);
-      FP32Vec8 y = x_vec * scale_vec;
-      y.save(output + i);
+    for (; i + 8 <= n; i += 8) {
+      vec_xst(vec_mul(vec_xl(0, input + i), scale_v), 0, output + i);
+      vec_xst(vec_mul(vec_xl(16, input + i), scale_v), 16, output + i);
     }
-
     for (; i < n; ++i) {
-      output[i] = input[i] * inv_rms_f;
+      output[i] = input[i] * inv_rms;
     }
   }
 }

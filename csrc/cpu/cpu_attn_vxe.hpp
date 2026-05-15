@@ -18,7 +18,6 @@ template <typename kv_cache_t>
 FORCE_INLINE void load_row8_B_as_f32(const kv_cache_t* p, __vector float& b0,
                                      __vector float& b1);
 
-// [1] Float Specialization
 template <>
 FORCE_INLINE void load_row8_B_as_f32<float>(const float* p, __vector float& b0,
                                             __vector float& b1) {
@@ -27,7 +26,6 @@ FORCE_INLINE void load_row8_B_as_f32<float>(const float* p, __vector float& b0,
   b1 = vec_xl((long long)0, const_cast<float*>(p + 4));
 }
 
-// [2] BFloat16 Specialization (Big Endian Fix)
 template <>
 FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
                                                     __vector float& b0,
@@ -39,8 +37,6 @@ FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
   // 2. Prepare Zero vector
   __vector unsigned short zeros = vec_splat_u16(0);
 
-  // 3. Merge High/Low to expand BF16 -> Float32
-  // On Big Endian, a float is [BF16_bits | 16_zero_bits]
   b0 = (__vector float)vec_mergeh(raw, zeros);
   b1 = (__vector float)vec_mergel(raw, zeros);
 }
@@ -293,7 +289,9 @@ class AttentionImpl<ISA::VXE, scalar_t, head_dim, kv_cache_scalar_t> {
                                 const int64_t q_num_stride,
                                 const int64_t q_head_stride, float scale) {
     __vector float scale_vec = vec_splats(scale);
+    constexpr bool is_fp32 = std::is_same<scalar_t, float>::value;
     constexpr bool is_bf16 = std::is_same<scalar_t, c10::BFloat16>::value;
+    constexpr bool is_fp16 = std::is_same<scalar_t, c10::Half>::value;
 
     // Process 8 elements at a time (32 bytes of float output)
     for (int32_t i = 0; i < q_num; ++i) {
@@ -303,27 +301,25 @@ class AttentionImpl<ISA::VXE, scalar_t, head_dim, kv_cache_scalar_t> {
             q_buffer + i * q_heads_per_kv * head_dim + h * head_dim;
 
         int32_t d = 0;
+
+        // Vectorized path: process 8 elements at once
         for (; d <= head_dim - 8; d += 8) {
-          if constexpr (is_bf16) {
-            __vector float v0, v1;
-            // Reuse our Big-Endian-Safe loader
+          __vector float v0, v1;
+
+          if constexpr (is_fp32) {
+            v0 = vec_xl((long long)0, (float*)(curr_src + d));
+            v1 = vec_xl((long long)0, (float*)(curr_src + d + 4));
+          } else if constexpr (is_bf16) {
             load_row8_B_as_f32<scalar_t>(curr_src + d, v0, v1);
-
-            v0 = vec_mul(v0, scale_vec);
-            v1 = vec_mul(v1, scale_vec);
-
-            vec_xst(v0, 0, curr_dst + d);
-            vec_xst(v1, 0, curr_dst + d + 4);
-          } else {
-            __vector float v0 = vec_xl((long long)0, (float*)curr_src + d);
-            __vector float v1 = vec_xl((long long)0, (float*)curr_src + d + 4);
-
-            v0 = vec_mul(v0, scale_vec);
-            v1 = vec_mul(v1, scale_vec);
-
-            vec_xst(v0, 0, curr_dst + d);
-            vec_xst(v1, 0, curr_dst + d + 4);
+          } else if constexpr (is_fp16) {
+            load_row8_B_as_f32<scalar_t>(curr_src + d, v0, v1);
           }
+
+          v0 = vec_mul(v0, scale_vec);
+          v1 = vec_mul(v1, scale_vec);
+
+          vec_xst(v0, 0, curr_dst + d);
+          vec_xst(v1, 0, curr_dst + d + 4);
         }
 
         for (; d < head_dim; ++d) {
