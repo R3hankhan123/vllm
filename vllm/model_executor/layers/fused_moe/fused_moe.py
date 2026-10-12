@@ -1808,17 +1808,33 @@ def fused_experts_impl(
         B_bias=w1_bias,
     )
 
-    apply_moe_activation(
-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
-    )
+    # Per-token dynamic quant fuses SiLU with the quant so the bf16
+    # activation is not written and read back. Static scales, block quant,
+    # and non-SiLU activations stay on the two-kernel path.
+    if (
+        activation_enum == MoEActivation.SILU
+        and block_shape is None
+        and per_channel_quant
+        and a2_scale is None
+        and (use_fp8_w8a8 or use_int8_w8a8)
+    ):
+        act_quant_dtype = current_platform.fp8_dtype() if use_fp8_w8a8 else torch.int8
+        qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_token_quant(
+            intermediate_cache1.view(-1, N),
+            quant_dtype=act_quant_dtype,
+        )
+    else:
+        apply_moe_activation(
+            activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
 
-    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-        A=intermediate_cache2,
-        A_scale=a2_scale,
-        quant_dtype=quant_dtype,
-        per_act_token_quant=per_channel_quant,
-        block_shape=block_shape,
-    )
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+        )
 
     if expert_map is not None:
         intermediate_cache3.zero_()

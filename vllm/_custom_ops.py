@@ -548,6 +548,45 @@ def silu_and_mul_per_block_quant(
     return output, scales
 
 
+# fused silu_and_mul + dynamic per-token quant
+def silu_and_mul_per_token_quant(
+    input: torch.Tensor,
+    quant_dtype: torch.dtype,
+    scale_ub: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SiLU-and-mul with dynamic per-token FP8 or INT8 quantization.
+
+    Args:
+        input: Gate and up projections, shape ``[num_tokens, 2 * hidden]``.
+        quant_dtype: ``torch.int8`` or the platform FP8 dtype.
+        scale_ub: Optional FP8 upper bound applied to the row absmax before
+            the scale is computed. Not used for INT8.
+
+    Returns:
+        Quantized activations ``[num_tokens, hidden]`` and per-token scales
+        ``[num_tokens, 1]``.
+
+    """
+    assert input.ndim == 2, f"input must be 2D [batch, hidden*2], got {input.shape}"
+    assert input.shape[-1] % 2 == 0, (
+        f"input last dim must be even (gate||up layout), got {input.shape[-1]}"
+    )
+    fp8_dtype = current_platform.fp8_dtype()
+    if quant_dtype not in (fp8_dtype, torch.int8):
+        raise ValueError(f"Unsupported quant_dtype: {quant_dtype}")
+    if scale_ub is not None and quant_dtype == torch.int8:
+        raise ValueError("scale_ub is only supported for FP8")
+
+    num_tokens = input.shape[0]
+    hidden_size = input.shape[-1] // 2
+    output = torch.empty(
+        (num_tokens, hidden_size), device=input.device, dtype=quant_dtype
+    )
+    scales = torch.empty((num_tokens, 1), device=input.device, dtype=torch.float32)
+    torch.ops._C.silu_and_mul_per_token_quant(output, input, scales, scale_ub)
+    return output, scales
+
+
 # quantization ops
 # awq
 def awq_dequantize(

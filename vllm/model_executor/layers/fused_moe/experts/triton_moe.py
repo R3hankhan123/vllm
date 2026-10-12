@@ -496,23 +496,42 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         a2q_scale: torch.Tensor | None = None
 
-        # Fuse SiLU+Mul + FP8 block quantize into a single kernel
-        # when conditions permit (gated SiLU, fp8 block quant with
-        # group_size=128, no LoRA requiring the BF16 intermediate).
-        # The fused kernel has no clamp parameter, so a configured
-        # SwiGLU clamp limit falls through to the unfused path.
+        # Fuse SiLU+Mul into the activation quant when the second GEMM reads
+        # a quantized activation and nothing else needs the bf16 SiLU output
+        # (LoRA, SwiGLU clamp). Block quant uses group size 64 or 128.
+        # Per-token dynamic quant covers FP8 and INT8.
         if (
             activation == MoEActivation.SILU
             and self.activation_config.clamp_limit is None
             and self.quant_config.use_fp8_w8a8
-            and self.block_shape == [128, 128]
+            and self.block_shape in ([64, 64], [128, 128])
             and lora_context is None
             and not is_deep_gemm_e8m0_used()
         ):
+            assert self.block_shape is not None
             qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
                 intermediate_cache1.view(-1, N),
-                group_size=128,
+                group_size=self.block_shape[1],
                 quant_dtype=current_platform.fp8_dtype(),
+            )
+        elif (
+            activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and lora_context is None
+            and self.block_shape is None
+            and self.per_act_token_quant
+            and not self.quantization_emulation
+            and a2_scale is None
+            and (self.quant_config.use_fp8_w8a8 or self.quant_config.use_int8_w8a8)
+        ):
+            act_quant_dtype = (
+                current_platform.fp8_dtype()
+                if self.quant_config.use_fp8_w8a8
+                else torch.int8
+            )
+            qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_token_quant(
+                intermediate_cache1.view(-1, N),
+                quant_dtype=act_quant_dtype,
             )
         else:
             self.activation(
