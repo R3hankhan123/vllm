@@ -163,3 +163,86 @@ def test_dispatch_cpu_unquantized_gemm_remove_weight_keeps_dtype(
     x = torch.randn(4, 16, dtype=weight_dtype)
     output = layer.cpu_linear(x, layer.weight, None)
     assert not output.isnan().any()
+
+
+class _FakeZdnnHandler:
+    def __init__(self, k: int, n: int) -> None:
+        self.k = k
+        self.n = n
+
+
+def _patch_s390x_zdnn_dispatch(monkeypatch, available: bool) -> None:
+    monkeypatch.setattr(
+        utils.current_platform, "get_cpu_architecture", lambda: CpuArchEnum.S390X
+    )
+    monkeypatch.setattr(utils.current_platform, "is_zen_cpu", lambda: False)
+    monkeypatch.setattr(utils, "check_cpu_sgl_kernel", lambda *args, **kwargs: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ZDNN_LINEAR", True, raising=False)
+    monkeypatch.setattr(utils.ops, "zdnn_linear_available", lambda: available)
+
+
+def test_dispatch_s390x_uses_zdnn_linear(monkeypatch):
+    _patch_s390x_zdnn_dispatch(monkeypatch, available=True)
+
+    created = {}
+
+    def create(weight, bias):
+        created["weight"] = weight.detach().clone()
+        created["bias"] = None if bias is None else bias.detach().clone()
+        return _FakeZdnnHandler(weight.size(0), weight.size(1))
+
+    ran = {}
+
+    def run(handler, x):
+        ran["k"] = handler.k
+        ran["n"] = handler.n
+        ran["m"] = x.shape[0]
+        return torch.empty(*x.shape[:-1], handler.n, dtype=x.dtype)
+
+    monkeypatch.setattr(utils.ops, "create_zdnn_linear", create)
+    monkeypatch.setattr(utils.ops, "zdnn_linear", run)
+
+    layer = torch.nn.Linear(4, 8, bias=True)
+    weight = layer.weight.detach().clone()
+    bias = layer.bias.detach().clone()
+    utils.dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+
+    torch.testing.assert_close(created["weight"], weight.t().contiguous())
+    torch.testing.assert_close(created["bias"], bias)
+    assert layer.weight.numel() == 0
+    out = layer.cpu_linear(torch.randn(3, 4), layer.weight, layer.bias)
+    assert ran == {"k": 4, "n": 8, "m": 3}
+    assert out.shape == (3, 8)
+
+
+def test_dispatch_s390x_zdnn_disabled_keeps_weight(monkeypatch):
+    _patch_s390x_zdnn_dispatch(monkeypatch, available=True)
+    monkeypatch.setattr(utils.envs, "VLLM_ZDNN_LINEAR", False, raising=False)
+    monkeypatch.setattr(utils.ops, "_supports_onednn", False)
+
+    def create(weight, bias):
+        raise AssertionError("zDNN linear is disabled")
+
+    monkeypatch.setattr(utils.ops, "create_zdnn_linear", create)
+    layer = torch.nn.Linear(4, 8, bias=False)
+    utils.dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+
+    assert layer.weight.numel() == 4 * 8
+
+
+def test_dispatch_s390x_zdnn_failure_keeps_weight(monkeypatch):
+    _patch_s390x_zdnn_dispatch(monkeypatch, available=True)
+    monkeypatch.setattr(utils.ops, "_supports_onednn", False)
+
+    def create(weight, bias):
+        raise RuntimeError("exceeds NNPA maximum tensor size")
+
+    monkeypatch.setattr(utils.ops, "create_zdnn_linear", create)
+    logs = []
+    monkeypatch.setattr(utils.logger, "warning_once", lambda *args: logs.append(args))
+
+    layer = torch.nn.Linear(4, 8, bias=False)
+    utils.dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+
+    assert layer.weight.numel() == 4 * 8
+    assert logs and "Failed to create zDNN linear" in logs[0][0]

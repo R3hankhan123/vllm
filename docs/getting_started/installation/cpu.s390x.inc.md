@@ -5,6 +5,8 @@ vLLM has experimental support for s390x architecture on IBM Z platform. For now,
 
 Currently, the CPU implementation for s390x architecture supports FP32, BF16 and FP16, as well as AWQ and GPTQ 4-bit quantization and compressed-tensors INT8 W8A8.
 
+On z16 and newer, a build that finds `libzdnn` offloads dense linear layers to NNPA (`zdnn_matmul_op`). Host values are converted to NNP-data-type-1 inside zDNN with the vector convert instructions (`VCRNF` for FP32; BF16 is widened to FP32 first). Attention, including its online softmax, stays on VXE. A weight whose K or N exceeds the NNPA dimension or tensor limit is split into tiles. z15, a build without `libzdnn`, and a layer that cannot fit even a single-element tile keep the oneDNN linear path. If zDNN is installed outside the default search path, set `ZDNN_ROOT` to that prefix. Set `VLLM_ZDNN_LINEAR=0` to keep oneDNN for every linear.
+
 --8<-- [end:installation]
 --8<-- [start:requirements]
 
@@ -32,7 +34,8 @@ dnf install -y \
     gcc-toolset-14 gcc-toolset-14-binutils gcc-toolset-14-libatomic-devel zlib-devel \
     libjpeg-turbo-devel libtiff-devel libpng-devel libwebp-devel freetype-devel harfbuzz-devel \
     openssl-devel openblas openblas-devel autoconf automake libtool cmake numpy libsndfile \
-    clang llvm-devel llvm-static clang-devel
+    clang llvm-devel llvm-static clang-devel \
+    libzdnn libzdnn-devel
 ```
 
 Build and install `numactl` from source:
@@ -161,6 +164,7 @@ docker run --rm \
     -p 8000:8000 \
     -e VLLM_CPU_KVCACHE_SPACE=<KV cache space> \
     -e VLLM_CPU_OMP_THREADS_BIND=<CPU cores for inference> \
+    -e VLLM_ZDNN_LINEAR=1 \
     vllm-cpu-env \
     --model meta-llama/Llama-3.2-1B-Instruct \
     --dtype bfloat16 \

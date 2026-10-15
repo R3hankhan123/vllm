@@ -3874,6 +3874,59 @@ class CPUDNNLGEMMHandler:
 
 
 _supports_onednn = bool(hasattr(torch.ops._C, "create_onednn_mm_handler"))
+_supports_zdnn = bool(hasattr(torch.ops._C, "zdnn_linear_available"))
+
+
+class CPUZdnnLinearHandler:
+    """Packed NNPA weight for zdnn_matmul_op. Bias is fused into the handler."""
+
+    def __init__(self) -> None:
+        self.handler_tensor: torch.Tensor | None = None
+        self.n = -1
+        self.k = -1
+        self.dtor = torch.ops._C.release_zdnn_linear_handler
+
+    def __del__(self):
+        if self.handler_tensor is not None:
+            self.dtor(self.handler_tensor.item())
+
+
+_zdnn_init_logged = False
+
+
+def zdnn_linear_available() -> bool:
+    """True when this build linked libzdnn and NNPA-MATMUL-OP is installed."""
+    global _zdnn_init_logged
+    if not _supports_zdnn:
+        return False
+    available = bool(torch.ops._C.zdnn_linear_available())
+    if available and not _zdnn_init_logged:
+        _zdnn_init_logged = True
+        logger.info("zDNN linear kernel is built and NNPA-MATMUL-OP is initialized")
+    return available
+
+
+def create_zdnn_linear(
+    weight: torch.Tensor,  # [K, N]
+    bias: torch.Tensor | None,
+) -> CPUZdnnLinearHandler:
+    handler = CPUZdnnLinearHandler()
+    handler.k, handler.n = weight.size()
+    handler.handler_tensor = torch.tensor(
+        torch.ops._C.create_zdnn_linear_handler(weight, bias),
+        dtype=torch.int64,
+    )
+    return handler
+
+
+def zdnn_linear(
+    handler: CPUZdnnLinearHandler,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    x2 = x.reshape(-1, handler.k)
+    output = torch.empty((x2.shape[0], handler.n), dtype=x.dtype, device=x.device)
+    torch.ops._C.zdnn_linear(output, x2, handler.handler_tensor)
+    return output.view(*x.shape[:-1], handler.n)
 
 
 def is_onednn_acl_supported():

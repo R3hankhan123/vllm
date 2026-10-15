@@ -32,6 +32,15 @@ void onednn_mm(torch::Tensor& c, const torch::Tensor& a,
 
 bool is_onednn_acl_supported();
 
+#if defined(__s390x__) && defined(VLLM_USE_ZDNN)
+bool zdnn_linear_available();
+int64_t create_zdnn_linear_handler(const torch::Tensor& weight,
+                                   const std::optional<torch::Tensor>& bias);
+void release_zdnn_linear_handler(int64_t handler);
+void zdnn_linear(torch::Tensor& out, const torch::Tensor& x,
+                 const torch::Tensor& handler_tensor);
+#endif
+
 void mla_decode_kvcache(torch::Tensor& out, torch::Tensor& query,
                         torch::Tensor& kv_cache, double scale,
                         torch::Tensor& block_tables, torch::Tensor& seq_lens);
@@ -614,6 +623,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor!? azp) -> ()");
   ops.impl("dynamic_scaled_int8_quant", torch::kCPU,
            &dynamic_scaled_int8_quant);
+#endif
+
+#if defined(__s390x__) && defined(VLLM_USE_ZDNN)
+  ops.def("zdnn_linear_available() -> bool", &zdnn_linear_available);
+  ops.def("create_zdnn_linear_handler(Tensor weight, Tensor? bias) -> int",
+          &create_zdnn_linear_handler);
+  ops.def("release_zdnn_linear_handler(int handler) -> ()",
+          &release_zdnn_linear_handler);
+  ops.def("zdnn_linear(Tensor! out, Tensor x, Tensor handler_tensor) -> ()");
+  ops.impl("zdnn_linear", torch::kCPU, &zdnn_linear);
 #endif
 
 // SHM CCL
