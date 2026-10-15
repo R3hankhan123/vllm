@@ -578,6 +578,38 @@ def dispatch_cpu_unquantized_gemm(
         )
         return
 
+    # NNPA matmul is the dense-linear path on z16+. K or N above the
+    # queried limit is tiled. A layer that still cannot be represented
+    # raises, and oneDNN handles that layer.
+    if (
+        current_platform.get_cpu_architecture() == CpuArchEnum.S390X
+        and dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and envs.VLLM_ZDNN_LINEAR
+        and ops.zdnn_linear_available()
+    ):
+        try:
+            bias = getattr(layer, "bias", None)
+            bias_arg = None if bias is None else bias.detach()
+            zdnn_handler = ops.create_zdnn_linear(
+                layer.weight.detach().t().contiguous(), bias_arg
+            )
+            layer.cpu_linear = lambda x, weight, bias, _h=zdnn_handler: ops.zdnn_linear(
+                _h, x
+            )
+            if remove_weight:
+                layer.weight = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device=layer.weight.device),
+                    requires_grad=False,
+                )
+            logger.debug_once(
+                "CPU unquantized GEMM dispatch: using zDNN zdnn_matmul_op"
+            )
+            return
+        except RuntimeError as e:
+            logger.warning_once(
+                f"Failed to create zDNN linear, fallback to oneDNN. Exception: {e}"
+            )
+
     if (
         ops._supports_onednn
         and current_platform.get_cpu_architecture() != CpuArchEnum.POWERPC

@@ -517,6 +517,33 @@ if (S390_FOUND)
         ${VLLM_EXT_SRC})
 endif()
 
+# NNPA linear via libzdnn. Optional: z15 and builds without the library keep
+# the oneDNN path. ZDNN_ROOT overrides the search path.
+option(VLLM_USE_ZDNN "Offload s390x dense linears to NNPA-MATMUL-OP" ON)
+set(VLLM_ZDNN_FOUND FALSE)
+if (S390_FOUND AND VLLM_USE_ZDNN)
+    set(_ZDNN_SEARCH_INC "")
+    set(_ZDNN_SEARCH_LIB "")
+    if (DEFINED ENV{ZDNN_ROOT})
+        list(APPEND _ZDNN_SEARCH_INC "$ENV{ZDNN_ROOT}/include")
+        list(APPEND _ZDNN_SEARCH_LIB "$ENV{ZDNN_ROOT}/lib" "$ENV{ZDNN_ROOT}/lib64")
+    endif()
+    find_path(ZDNN_INCLUDE_DIR zdnn.h
+        HINTS ${_ZDNN_SEARCH_INC}
+        PATHS /usr/include /usr/local/include)
+    find_library(ZDNN_LIBRARY zdnn
+        HINTS ${_ZDNN_SEARCH_LIB}
+        PATHS /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib)
+    if (ZDNN_INCLUDE_DIR AND ZDNN_LIBRARY)
+        message(STATUS "zDNN found: ${ZDNN_LIBRARY}")
+        set(VLLM_ZDNN_FOUND TRUE)
+        set(VLLM_EXT_SRC "csrc/cpu/zdnn-kernels/linear.cpp" ${VLLM_EXT_SRC})
+        list(APPEND LIBS ${ZDNN_LIBRARY})
+    else()
+        message(STATUS "zDNN not found; s390x dense linear stays on oneDNN")
+    endif()
+endif()
+
 if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
     set(VLLM_EXT_SRC
         "csrc/cpu/shm.cpp"
@@ -692,6 +719,10 @@ else()
     )
     if (VLLM_OPENBLAS_LIB)
         target_compile_definitions(_C PRIVATE VLLM_HAS_OPENBLAS)
+    endif()
+    if (VLLM_ZDNN_FOUND)
+        target_include_directories(_C PRIVATE ${ZDNN_INCLUDE_DIR})
+        target_compile_definitions(_C PRIVATE VLLM_USE_ZDNN)
     endif()
 endif()
 
