@@ -134,13 +134,14 @@ class OMPProcessManager:
                 cpu_list, reserve_list = self._get_autobind_cpu_ids(
                     lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4]
                 )
-            elif cpu_arch in (CpuArchEnum.X86, CpuArchEnum.S390X):
-                # For x86/S390X SMT-2, use 1 logical CPU per physical core
+            elif cpu_arch == CpuArchEnum.X86:
+                # For x86 SMT-2, use 1 logical CPU per physical core
                 cpu_list, reserve_list = self._get_autobind_cpu_ids(
                     lambda cpus: cpus[-1:]
                 )
-            elif cpu_arch in (CpuArchEnum.ARM, CpuArchEnum.RISCV):
-                # For AArch64 / RISC-V, no SMT, use all logical CPUs
+            elif cpu_arch in (CpuArchEnum.ARM, CpuArchEnum.RISCV, CpuArchEnum.S390X):
+                # For AArch64 / RISC-V, no SMT, use all logical CPUs. For S390X,
+                # use both SMT-2 threads of every core in the book.
                 cpu_list, reserve_list = self._get_autobind_cpu_ids(lambda cpus: cpus)
             else:
                 cpu_list, reserve_list = [], []

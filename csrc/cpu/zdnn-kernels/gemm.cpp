@@ -17,13 +17,14 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 
-#include "cpu/micro_gemm/cpu_micro_gemm_dlf16.hpp"
+#include "cpu/micro_gemm/cpu_micro_gemm_zdnn.hpp"
 
 // Some packaged zdnn.h versions lack their own extern "C" guard.
 extern "C" {
 #include <zdnn.h>
 }
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -73,6 +74,49 @@ zdnn_data_types to_zdnn_type(at::ScalarType t) {
     default:
       TORCH_CHECK(false, "zDNN linear: unsupported dtype ", t);
   }
+}
+
+template <typename T>
+bool all_in_dlf16_range(const T* x, int64_t n) {
+  const float max = std::ldexp(1.0f + 510.0f / 512.0f, 32);
+  for (int64_t i = 0; i < n; ++i) {
+    if (!(std::abs(static_cast<float>(x[i])) <= max)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// zDNN fails to stickify NaN, Inf or out-of-range values, but has already
+// written them as NINF, which the NNPA propagates to the output. Such inputs
+// (e.g. uninitialized buffers in vLLM's profiling run) then give non-finite
+// outputs like any GEMM, so only a failure on in-range data is an error.
+void check_activation_stickify(zdnn_status status, const uint8_t* src,
+                               int64_t n, zdnn_data_types type) {
+  if (status == ZDNN_CONVERT_FAILURE) {
+    bool in_range = true;
+    switch (type) {
+      case BFLOAT:
+        in_range =
+            all_in_dlf16_range(reinterpret_cast<const c10::BFloat16*>(src), n);
+        break;
+      case FP16:
+        in_range =
+            all_in_dlf16_range(reinterpret_cast<const c10::Half*>(src), n);
+        break;
+      default:
+        in_range = all_in_dlf16_range(reinterpret_cast<const float*>(src), n);
+    }
+    if (!in_range) {
+      TORCH_WARN_ONCE(
+          "zDNN linear: input has NaN, Inf or values beyond the DLFLOAT16 "
+          "range; the affected outputs are non-finite.");
+      return;
+    }
+  }
+  TORCH_CHECK(status == ZDNN_OK || status == ZDNN_ELEMENT_RANGE_VIOLATION,
+              "zDNN linear: activation stickify failed: ",
+              zdnn_get_status_message(status));
 }
 
 // A ztensor plus the descriptors it points to.
@@ -131,6 +175,50 @@ uint8_t* aligned_workspace(int64_t bytes) {
 // rows is bound by streaming the weight, which the NNPA does at well below
 // memory bandwidth. All threads read the same stickified DLFLOAT16 weight.
 constexpr int64_t kGemvMaxM = 8;
+// Rows of a 64-column group swept at a time (32 KB of DLFLOAT16), so the four
+// 16-column tiles reuse it from L1 and each line is fetched from memory once.
+constexpr int64_t kGemvKBlock = 256;
+
+// Splits K so the (group, split) work items divide evenly across threads;
+// otherwise e.g. 40 groups on 16 threads leaves the slowest thread 3 groups.
+int64_t gemv_k_splits(int64_t groups, int64_t K) {
+  const int64_t threads = at::get_num_threads();
+  int64_t best = 1;
+  int64_t best_items = div_up(groups, threads);
+  for (int64_t s = 2; s <= 4 && K / s >= kGemvKBlock; ++s) {
+    const int64_t items = div_up(groups * s, threads);
+    if (items * best < best_items * s) {
+      best = s;
+      best_items = items;
+    }
+  }
+  return best;
+}
+
+// out[m, :cols] = c[m, :cols] + bias for a 64-column group.
+template <typename scalar_t>
+void store_group(scalar_t* out, int64_t ldo, float* c, int64_t ldc,
+                 const uint16_t* bias, int64_t M, int64_t cols) {
+  using scalar_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
+  constexpr int64_t tile_n = 16;
+  for (int64_t t = 0; t < cols; t += tile_n) {
+    const vec_op::FP32Vec16 b = cpu_micro_gemm::load_dlf16x16(bias + t);
+    const int64_t nt = std::min(tile_n, cols - t);
+    for (int64_t m = 0; m < M; ++m) {
+      float* c_row = c + m * ldc + t;
+      const vec_op::FP32Vec16 res = vec_op::FP32Vec16(c_row) + b;
+      scalar_t* o = out + m * ldo + t;
+      if (nt == tile_n) {
+        scalar_vec_t(res).save(o);
+      } else {
+        res.save(c_row);
+        for (int64_t j = 0; j < nt; ++j) {
+          o[j] = static_cast<scalar_t>(c_row[j]);
+        }
+      }
+    }
+  }
+}
 
 template <typename scalar_t>
 void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
@@ -138,13 +226,17 @@ void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
                         const uint8_t* b_base, int64_t M, int64_t N,
                         int64_t K) {
   using gemm_t = cpu_micro_gemm::TileGemmDLF16<float>;
-  using scalar_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
   constexpr int64_t tile_n = gemm_t::NSize;
   const int64_t group_bytes = stick_bytes(K, kStickCols);
+  const int64_t groups = div_up(N, kStickCols);
+  const int64_t splits = gemv_k_splits(groups, K);
+  const int64_t split_k = div_up(K, splits);
+  const int64_t ldp = groups * kStickCols;
 
   // Widen the activation once so the micro-kernel splats it straight from
   // memory instead of converting inside the K loop.
   thread_local std::vector<float> a_fp32;
+  thread_local std::vector<float> partial;
   a_fp32.resize(M * K);
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t k = 0; k < K; ++k) {
@@ -152,42 +244,66 @@ void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
     }
   }
   const float* a = a_fp32.data();
+  if (splits > 1) {
+    partial.resize(splits * M * ldp);
+  }
+  float* p = partial.data();
 
-  at::parallel_for(
-      0, div_up(N, kStickCols), 1, [&](int64_t begin, int64_t end) {
-        alignas(64) float c[kGemvMaxM * tile_n];
-        for (int64_t g = begin; g < end; ++g) {
-          const auto* wg =
-              reinterpret_cast<const uint16_t*>(w_base + g * group_bytes);
-          const auto* bg =
-              reinterpret_cast<const uint16_t*>(b_base + g * kPageBytes);
-          for (int64_t t = 0; t < kStickCols && g * kStickCols + t < N;
-               t += tile_n) {
-            const int64_t n0 = g * kStickCols + t;
-            const int64_t nt = std::min(tile_n, N - n0);
-            for (int64_t m0 = 0; m0 < M; m0 += gemm_t::MaxMSize) {
-              gemm_t::gemm(a + m0 * K, wg + t, c + m0 * tile_n,
-                           std::min<int64_t>(gemm_t::MaxMSize, M - m0), K, K,
-                           tile_n);
-            }
-            const vec_op::FP32Vec16 bias =
-                cpu_micro_gemm::load_dlf16x16(bg + t);
-            for (int64_t m = 0; m < M; ++m) {
-              float* c_row = c + m * tile_n;
-              const vec_op::FP32Vec16 res = vec_op::FP32Vec16(c_row) + bias;
-              scalar_t* o = out + m * ldo + n0;
-              if (nt == tile_n) {
-                scalar_vec_t(res).save(o);
-              } else {
-                res.save(c_row);
-                for (int64_t j = 0; j < nt; ++j) {
-                  o[j] = static_cast<scalar_t>(c_row[j]);
-                }
-              }
-            }
+  auto bias_of = [&](int64_t g) {
+    return reinterpret_cast<const uint16_t*>(b_base + g * kPageBytes);
+  };
+
+  at::parallel_for(0, groups * splits, 1, [&](int64_t begin, int64_t end) {
+    alignas(64) float c[kGemvMaxM * kStickCols];
+    for (int64_t item = begin; item < end; ++item) {
+      const int64_t g = item / splits;
+      const int64_t s = item % splits;
+      const int64_t k0 = s * split_k;
+      const int64_t k1 = std::min(K, k0 + split_k);
+      const int64_t cols = std::min(kStickCols, N - g * kStickCols);
+      const auto* wg =
+          reinterpret_cast<const uint16_t*>(w_base + g * group_bytes);
+      for (int64_t kb = k0; kb < k1; kb += kGemvKBlock) {
+        const int32_t kn = std::min(kGemvKBlock, k1 - kb);
+        for (int64_t t = 0; t < cols; t += tile_n) {
+          for (int64_t m0 = 0; m0 < M; m0 += gemm_t::MaxMSize) {
+            gemm_t::gemm(a + m0 * K + kb, wg + kb * kStickCols + t,
+                         c + m0 * kStickCols + t,
+                         std::min<int64_t>(gemm_t::MaxMSize, M - m0), kn, K,
+                         kStickCols, kb != k0);
           }
         }
-      });
+      }
+      if (splits == 1) {
+        store_group(out + g * kStickCols, ldo, c, kStickCols, bias_of(g), M,
+                    cols);
+      } else {
+        for (int64_t m = 0; m < M; ++m) {
+          std::memcpy(p + (s * M + m) * ldp + g * kStickCols,
+                      c + m * kStickCols, cols * sizeof(float));
+        }
+      }
+    }
+  });
+
+  if (splits == 1) {
+    return;
+  }
+  at::parallel_for(0, groups, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t g = begin; g < end; ++g) {
+      const int64_t cols = std::min(kStickCols, N - g * kStickCols);
+      float* c = p + g * kStickCols;
+      for (int64_t s = 1; s < splits; ++s) {
+        for (int64_t m = 0; m < M; ++m) {
+          const float* src = c + (s * M + m) * ldp;
+          for (int64_t j = 0; j < cols; ++j) {
+            c[m * ldp + j] += src[j];
+          }
+        }
+      }
+      store_group(out + g * kStickCols, ldo, c, ldp, bias_of(g), M, cols);
+    }
+  });
 }
 
 }  // namespace
@@ -336,7 +452,9 @@ void zdnn_weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
           src = padded.data();
         }
         ZTensor za(ZDNN_2D, type, a_buf + s * a_slice_bytes, false, rows, K);
-        ZDNN_CHECK(zdnn_transform_ztensor(&za.zt, const_cast<uint8_t*>(src)));
+        check_activation_stickify(
+            zdnn_transform_ztensor(&za.zt, const_cast<uint8_t*>(src)), src,
+            rows * K, type);
       }
     });
 
