@@ -3466,6 +3466,32 @@ def weight_packed_linear_cpu(
     return output
 
 
+_supports_zdnn = bool(hasattr(torch.ops._C, "zdnn_weight_packed_linear"))
+
+
+def zdnn_is_available() -> bool:
+    return _supports_zdnn and torch.ops._C.zdnn_is_available()
+
+
+def zdnn_convert_weight_packed(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    return torch.ops._C.zdnn_convert_weight_packed(weight, bias)
+
+
+def zdnn_weight_packed_linear(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    output = torch.empty((*x.shape[0:-1], n), dtype=x.dtype)
+    torch.ops._C.zdnn_weight_packed_linear(
+        output.view(-1, n), x.reshape(-1, x.size(-1)), packed_weight, n
+    )
+    return output
+
+
 class CPUQuantMethod(IntEnum):
     UNQUANT = 0
     INT8_W8A8 = 1

@@ -515,6 +515,19 @@ if (S390_FOUND)
     set(VLLM_EXT_SRC
         "csrc/cpu/cpu_wna16.cpp"
         ${VLLM_EXT_SRC})
+
+    # zDNN offloads linear layers to the NNPA (z16+); optional at build time.
+    find_path(ZDNN_INCLUDE_DIR zdnn.h)
+    find_library(ZDNN_LIB zdnn)
+    if (ZDNN_INCLUDE_DIR AND ZDNN_LIB)
+        message(STATUS "zDNN found: ${ZDNN_LIB}")
+        set(VLLM_EXT_SRC
+            "csrc/cpu/zdnn-kernels/gemm.cpp"
+            ${VLLM_EXT_SRC})
+        list(APPEND LIBS ${ZDNN_LIB})
+    else()
+        message(STATUS "zDNN not found, NNPA linear kernels are disabled")
+    endif()
 endif()
 
 if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
@@ -692,6 +705,10 @@ else()
     )
     if (VLLM_OPENBLAS_LIB)
         target_compile_definitions(_C PRIVATE VLLM_HAS_OPENBLAS)
+    endif()
+    if (ZDNN_INCLUDE_DIR AND ZDNN_LIB)
+        target_include_directories(_C PRIVATE ${ZDNN_INCLUDE_DIR})
+        target_compile_definitions(_C PRIVATE VLLM_HAS_ZDNN)
     endif()
 endif()
 

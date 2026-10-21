@@ -638,6 +638,31 @@ def dispatch_cpu_unquantized_gemm(
         return
 
     if (
+        envs.VLLM_CPU_ZDNN_LINEAR
+        and current_platform.get_cpu_architecture() == CpuArchEnum.S390X
+        and ops.zdnn_is_available()
+    ):
+        try:
+            # The bias is folded into the packed weight.
+            packed_weight = ops.zdnn_convert_weight_packed(
+                layer.weight, getattr(layer, "bias", None)
+            )
+            layer.cpu_linear = lambda x, weight, bias: ops.zdnn_weight_packed_linear(
+                x, packed_weight, N
+            )
+            if remove_weight:
+                layer.weight = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device=layer.weight.device),
+                    requires_grad=False,
+                )
+            logger.info_once("zDNN (NNPA) linear kernels initialized")
+            return
+        except RuntimeError as e:
+            logger.warning_once(
+                "Failed to create zDNN linear, falling back. Exception: %s", e
+            )
+
+    if (
         ops._supports_onednn
         and current_platform.get_cpu_architecture() != CpuArchEnum.POWERPC
     ):

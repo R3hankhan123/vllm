@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_CPU_ZDNN_LINEAR: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -919,6 +920,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ, and
     # on Zen CPUs whether to serve int4 checkpoints as DA8W4 rather than W4A16.
     "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    # (CPU backend, IBM Z only) run unquantized linear layers on the z16+ Neural
+    # Network Processing Assist (NNPA) through zDNN. Requires vLLM built against
+    # libzdnn. Weights are prepacked to DLFLOAT16 at load time. Enabled by
+    # default when the NNPA is available; set to 0 to use oneDNN instead.
+    "VLLM_CPU_ZDNN_LINEAR": lambda: bool(int(os.getenv("VLLM_CPU_ZDNN_LINEAR", "1"))),
     # Using a flag to control microbatch on XPU device, users on XPU device can
     # decide to disable it when they needed.
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(

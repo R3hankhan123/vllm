@@ -56,6 +56,15 @@ void shm_send_tensor_list(int64_t handle,
 
 std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
+// zDNN (IBM Z NNPA) kernels
+bool zdnn_is_available();
+
+at::Tensor zdnn_convert_weight_packed(const at::Tensor& weight,
+                                      const std::optional<at::Tensor>& bias);
+
+void zdnn_weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
+                               const at::Tensor& packed, int64_t N);
+
 // SGL CPU kernels
 
 void weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
@@ -918,6 +927,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor scales, Tensor? zeros, Tensor? bias, SymInt "
       "pack_factor, str isa_hint) -> ()");
   ops.impl("cpu_gemm_wna16", torch::kCPU, &cpu_gemm_wna16);
+#endif
+
+  // zDNN (IBM Z NNPA) linear
+#ifdef VLLM_HAS_ZDNN
+  ops.def("zdnn_is_available() -> bool", &zdnn_is_available);
+  ops.def("zdnn_convert_weight_packed(Tensor weight, Tensor? bias) -> Tensor");
+  ops.impl("zdnn_convert_weight_packed", torch::kCPU,
+           &zdnn_convert_weight_packed);
+  ops.def(
+      "zdnn_weight_packed_linear(Tensor(a0!) out, Tensor mat1, Tensor packed, "
+      "int N) -> ()");
+  ops.impl("zdnn_weight_packed_linear", torch::kCPU,
+           &zdnn_weight_packed_linear);
 #endif
 
   // fused moe

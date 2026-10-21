@@ -12,6 +12,7 @@ Currently, the CPU implementation for s390x architecture supports FP32, BF16 and
 - SDK: `gcc/g++ >= 14.0.0` or later with Command Line Tools
 - Instruction Set Architecture (ISA): VXE support is required. Works with Z15 and above.
 - Build from source python packages (no pre-built s390x wheels): `torchvision`, `llvmlite`, `numba`, `opencv-python-headless`, `hf-xet`, `torchcodec`
+- Optional: [zDNN](https://github.com/IBM/zDNN) to run linear layers on the z16+ Neural Network Processing Assist (NNPA); see the build instructions below.
 
 --8<-- [end:requirements]
 --8<-- [start:set-up-using-python]
@@ -140,6 +141,25 @@ VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 python setup.py bdist_wheel && \
 
     The Docker image (`Dockerfile.s390x`) already includes TCMalloc and sets
     `LD_PRELOAD` automatically.
+
+!!! tip "NNPA acceleration with zDNN"
+
+    On z16 and later, vLLM can run unquantized (FP32/BF16/FP16) linear layers on the
+    on-chip AI accelerator (NNPA) through IBM's [zDNN](https://github.com/IBM/zDNN)
+    library. Weights are converted once at load time to the NNPA DLFLOAT16 layout.
+
+    The kernels are compiled in only when `zdnn.h` and `libzdnn.so` are found while
+    building vLLM. `Dockerfile.s390x` already installs zDNN. For a source build,
+    install it from the package manager first:
+
+    ```bash
+    dnf install -y libzdnn libzdnn-devel
+    ```
+
+    The kernels are enabled by default when the NNPA is available, and vLLM logs
+    `zDNN (NNPA) linear kernels initialized` at startup. Set
+    `VLLM_CPU_ZDNN_LINEAR=0` to use oneDNN instead. Layers whose shape exceeds
+    the NNPA limits, and machines without an NNPA, fall back to the oneDNN path.
 
 --8<-- [end:build-wheel-from-source]
 --8<-- [start:pre-built-images]

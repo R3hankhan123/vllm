@@ -17,7 +17,7 @@ RUN microdnf install -y \
     which procps findutils tar vim git gcc-toolset-14 gcc-toolset-14-binutils gcc-toolset-14-libatomic-devel patch zlib-devel \
     libjpeg-turbo-devel libtiff-devel libpng-devel libwebp-devel freetype-devel harfbuzz-devel \
     openssl-devel openblas openblas-devel autoconf automake libtool cmake numpy libsndfile \
-    clang llvm-devel llvm-static clang-devel && \
+    clang llvm-devel llvm-static clang-devel libzdnn libzdnn-devel && \
     microdnf clean all
 
 ENV GCC_TOOLSET_ROOT=/opt/rh/gcc-toolset-14/root \
