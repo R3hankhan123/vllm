@@ -17,6 +17,13 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 
+// The decode GEMV needs the z16 NNP vector conversions; without them only the
+// NNPA path is built, and z15 has no NNPA anyway.
+#if __ARCH__ >= 14
+  #define VLLM_ZDNN_GEMV
+  #include "cpu/micro_gemm/cpu_micro_gemm_dlf16.hpp"
+#endif
+
 // Some packaged zdnn.h versions lack their own extern "C" guard.
 extern "C" {
 #include <zdnn.h>
@@ -125,6 +132,60 @@ uint8_t* aligned_workspace(int64_t bytes) {
   return static_cast<uint8_t*>(buffer.get());
 }
 
+#ifdef VLLM_ZDNN_GEMV
+// Decode-sized M runs on the CPU cores instead of the NNPA: a matmul with few
+// rows is bound by streaming the weight, which the NNPA does at well below
+// memory bandwidth. All threads read the same stickified DLFLOAT16 weight.
+constexpr int64_t kGemvMaxM = 8;
+
+template <typename scalar_t>
+void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
+                        int64_t lda, const uint8_t* w_base,
+                        const uint8_t* b_base, int64_t M, int64_t N,
+                        int64_t K) {
+  using gemm_t = cpu_micro_gemm::TileGemmDLF16<scalar_t>;
+  using scalar_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
+  constexpr int64_t tile_n = gemm_t::NSize;
+  const int64_t group_bytes = stick_bytes(K, kStickCols);
+
+  at::parallel_for(
+      0, div_up(N, kStickCols), 1, [&](int64_t begin, int64_t end) {
+        alignas(64) float c[kGemvMaxM * tile_n];
+        for (int64_t g = begin; g < end; ++g) {
+          const auto* wg =
+              reinterpret_cast<const uint16_t*>(w_base + g * group_bytes);
+          const auto* bg =
+              reinterpret_cast<const uint16_t*>(b_base + g * kPageBytes);
+          for (int64_t t = 0; t < kStickCols && g * kStickCols + t < N;
+               t += tile_n) {
+            const int64_t n0 = g * kStickCols + t;
+            const int64_t nt = std::min(tile_n, N - n0);
+            for (int64_t m0 = 0; m0 < M; m0 += gemm_t::MaxMSize) {
+              gemm_t::gemm(mat1 + m0 * lda, wg + t, c + m0 * tile_n,
+                           std::min<int64_t>(gemm_t::MaxMSize, M - m0), K, lda,
+                           tile_n);
+            }
+            const vec_op::FP32Vec16 bias =
+                cpu_micro_gemm::load_dlf16x16(bg + t);
+            for (int64_t m = 0; m < M; ++m) {
+              float* c_row = c + m * tile_n;
+              const vec_op::FP32Vec16 res = vec_op::FP32Vec16(c_row) + bias;
+              scalar_t* o = out + m * ldo + n0;
+              if (nt == tile_n) {
+                scalar_vec_t(res).save(o);
+              } else {
+                res.save(c_row);
+                for (int64_t j = 0; j < nt; ++j) {
+                  o[j] = static_cast<scalar_t>(c_row[j]);
+                }
+              }
+            }
+          }
+        }
+      });
+}
+#endif
+
 }  // namespace
 
 bool zdnn_is_available() { return zdnn_is_nnpa_installed(); }
@@ -202,11 +263,28 @@ void zdnn_weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
     return;
   }
 
+  uint8_t* w_base = static_cast<uint8_t*>(packed.data_ptr());
+  uint8_t* b_base = w_base + stick_bytes(K, N);
+#ifdef VLLM_ZDNN_GEMV
+  if (M <= kGemvMaxM) {
+    AT_DISPATCH_SWITCH(
+        mat1.scalar_type(), "zdnn_gemv",
+        AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES([&] {
+          gemv_packed_linear<scalar_t>(out.data_ptr<scalar_t>(), out.stride(0),
+                                       mat1.data_ptr<scalar_t>(),
+                                       mat1.stride(0), w_base, b_base, M, N, K);
+        }) AT_DISPATCH_CASE(at::kFloat, [&] {
+          gemv_packed_linear<scalar_t>(out.data_ptr<scalar_t>(), out.stride(0),
+                                       mat1.data_ptr<scalar_t>(),
+                                       mat1.stride(0), w_base, b_base, M, N, K);
+        }));
+    return;
+  }
+#endif
+
   const zdnn_data_types type = to_zdnn_type(mat1.scalar_type());
   const auto& limits = nnpa_limits();
   const int64_t n_chunk = std::min(max_n_chunk(K), N);
-  uint8_t* w_base = static_cast<uint8_t*>(packed.data_ptr());
-  uint8_t* b_base = w_base + stick_bytes(K, N);
 
   // Slice M into stacked row blocks: one per thread, each a multiple of the
   // 32-row stick height and within the NNPA dimension/size limits.

@@ -10,12 +10,16 @@ from vllm import _custom_ops as ops
 if not ops.zdnn_is_available():
     pytest.skip("zDNN kernels or NNPA not available", allow_module_level=True)
 
-# Covers: N/K not multiples of the 64-wide stick, M not a multiple of the
-# 32-row stick (padded last slice), multiple M-slices, and N above the NNPA
-# max dimension index size (split into several matmul calls).
+# Covers: the CPU decode GEMV (M <= 8) including ragged 16-column tiles, N/K
+# not multiples of the 64-wide stick, M not a multiple of the 32-row stick
+# (padded last slice), multiple M-slices, and N above the NNPA max dimension
+# index size (split into several matmul calls).
 SHAPES = [
     (1, 128, 64),
+    (4, 3584, 2048),
+    (5, 17, 129),
     (7, 491, 1023),
+    (9, 129, 257),
     (257, 4096, 4096),
     (33, 40000, 128),
 ]
@@ -57,12 +61,14 @@ def test_zdnn_weight_packed_linear_strided_3d_input():
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
 
 
+# m=4 takes the CPU decode GEMV, m=1537 the NNPA path with a partial M-slice.
+@pytest.mark.parametrize("m", [4, 1537])
 @torch.inference_mode()
-def test_zdnn_weight_packed_linear_inference_mode():
+def test_zdnn_weight_packed_linear_inference_mode(m: int):
     """Inference mode (as used by vLLM) is not inherited by OpenMP worker
-    threads; a partial last M-slice must still be written without error."""
+    threads; both paths must still write the output without error."""
     torch.manual_seed(0)
-    m, n, k = 1537, 3584, 2048
+    n, k = 3584, 2048
     x = torch.randn(m, k, dtype=torch.bfloat16)
     weight = (torch.randn(n, k) / k**0.5).to(torch.bfloat16)
 
