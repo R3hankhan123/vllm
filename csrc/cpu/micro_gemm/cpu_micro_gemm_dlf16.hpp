@@ -1,11 +1,6 @@
 #ifndef CPU_MICRO_GEMM_DLF16_HPP
 #define CPU_MICRO_GEMM_DLF16_HPP
 
-#if !defined(__s390x__) || __ARCH__ < 14
-  #error \
-      "cpu_micro_gemm_dlf16.hpp requires s390x z16+ (NNPA vector conversions)"
-#endif
-
 #include "cpu/micro_gemm/cpu_micro_gemm_impl.hpp"
 
 namespace cpu_micro_gemm {
