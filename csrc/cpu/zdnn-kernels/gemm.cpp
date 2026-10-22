@@ -24,6 +24,7 @@ extern "C" {
 #include <zdnn.h>
 }
 
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -119,6 +120,23 @@ void check_activation_stickify(zdnn_status status, const uint8_t* src,
               zdnn_get_status_message(status));
 }
 
+// Unstickifying writes every element, storing inf where a DLFLOAT16 value
+// (NINF propagated from a non-finite input, or a result beyond fp16) does
+// not fit the host dtype, then reports ZDNN_CONVERT_FAILURE. Those outputs
+// are non-finite like any GEMM's, so only other failures are errors.
+void check_output_unstick(zdnn_status status) {
+  if (status == ZDNN_CONVERT_FAILURE) {
+    std::feclearexcept(FE_ALL_EXCEPT);
+    TORCH_WARN_ONCE(
+        "zDNN linear: output exceeded the host dtype range; the affected "
+        "outputs are non-finite.");
+    return;
+  }
+  TORCH_CHECK(status == ZDNN_OK || status == ZDNN_ELEMENT_RANGE_VIOLATION,
+              "zDNN linear: output unstickify failed: ",
+              zdnn_get_status_message(status));
+}
+
 // A ztensor plus the descriptors it points to.
 struct ZTensor {
   zdnn_tensor_desc pre_desc;
@@ -178,6 +196,16 @@ constexpr int64_t kGemvMaxM = 8;
 // Rows of a 64-column group swept at a time (32 KB of DLFLOAT16), so the four
 // 16-column tiles reuse it from L1 and each line is fetched from memory once.
 constexpr int64_t kGemvKBlock = 256;
+
+// Requests the next K block of a weight group while the current one is
+// computed, so each thread keeps many cache-line fetches in flight.
+inline void prefetch_rows(const uint16_t* rows, int64_t n) {
+  constexpr int64_t kLineBytes = 256;
+  const auto* p = reinterpret_cast<const char*>(rows);
+  for (int64_t off = 0; off < n * kStickCols * 2; off += kLineBytes) {
+    __builtin_prefetch(p + off);
+  }
+}
 
 // Splits K so the (group, split) work items divide evenly across threads;
 // otherwise e.g. 40 groups on 16 threads leaves the slowest thread 3 groups.
@@ -265,6 +293,17 @@ void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
           reinterpret_cast<const uint16_t*>(w_base + g * group_bytes);
       for (int64_t kb = k0; kb < k1; kb += kGemvKBlock) {
         const int32_t kn = std::min(kGemvKBlock, k1 - kb);
+        if (kb + kGemvKBlock < k1) {
+          prefetch_rows(wg + (kb + kGemvKBlock) * kStickCols,
+                        std::min(kGemvKBlock, k1 - kb - kGemvKBlock));
+        } else if (item + 1 < end) {
+          const int64_t g1 = (item + 1) / splits;
+          const int64_t kb1 = (item + 1) % splits * split_k;
+          prefetch_rows(
+              reinterpret_cast<const uint16_t*>(w_base + g1 * group_bytes) +
+                  kb1 * kStickCols,
+              std::min(kGemvKBlock, K - kb1));
+        }
         for (int64_t t = 0; t < cols; t += tile_n) {
           for (int64_t m0 = 0; m0 < M; m0 += gemm_t::MaxMSize) {
             gemm_t::gemm(a + m0 * K + kb, wg + kb * kStickCols + t,
@@ -478,10 +517,10 @@ void zdnn_weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
           uint8_t* out_rows = out_ptr + r0 * out_row_bytes + n0 * elem;
           ZTensor zs(ZDNN_2D, type, o_buf + s * o_slice_bytes, true, rows, n);
           if (r == rows && n * elem == out_row_bytes) {
-            ZDNN_CHECK(zdnn_transform_origtensor(&zs.zt, out_rows));
+            check_output_unstick(zdnn_transform_origtensor(&zs.zt, out_rows));
           } else {
             dst.resize(rows * n * elem);
-            ZDNN_CHECK(zdnn_transform_origtensor(&zs.zt, dst.data()));
+            check_output_unstick(zdnn_transform_origtensor(&zs.zt, dst.data()));
             for (int64_t i = 0; i < r; ++i) {
               std::memcpy(out_rows + i * out_row_bytes,
                           dst.data() + i * n * elem, n * elem);

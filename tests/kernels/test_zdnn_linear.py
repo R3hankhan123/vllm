@@ -84,15 +84,16 @@ def test_zdnn_weight_packed_linear_inference_mode(m: int):
 
 # m=4 takes the CPU decode GEMV, m=64 the NNPA path.
 @pytest.mark.parametrize("m", [4, 64])
-def test_zdnn_weight_packed_linear_non_finite_input(m: int):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_zdnn_weight_packed_linear_non_finite_input(m: int, dtype: torch.dtype):
     """NaN/Inf activations (e.g. vLLM's profiling run reading uninitialized
     buffers) give non-finite rows instead of raising; other rows are exact."""
     torch.manual_seed(0)
     n, k = 300, 256
-    x = torch.randn(m, k, dtype=torch.bfloat16)
+    x = torch.randn(m, k, dtype=dtype)
     x[0, 3] = float("nan")
     x[1, 7] = float("inf")
-    weight = (torch.randn(n, k) / k**0.5).to(torch.bfloat16)
+    weight = (torch.randn(n, k) / k**0.5).to(dtype)
 
     packed = ops.zdnn_convert_weight_packed(weight, None)
     out = ops.zdnn_weight_packed_linear(x, packed, n)
@@ -100,3 +101,16 @@ def test_zdnn_weight_packed_linear_non_finite_input(m: int):
     ref = torch.nn.functional.linear(x.float(), weight.float())
     assert not out[:2].isfinite().all(dim=1).any()
     torch.testing.assert_close(out[2:].float(), ref[2:], atol=3e-2, rtol=3e-2)
+
+
+def test_zdnn_weight_packed_linear_fp16_output_overflow():
+    """In-range fp16 inputs whose product exceeds fp16 give inf instead of
+    raising when the NNPA path unstickifies the output."""
+    m, n, k = 64, 128, 256
+    x = torch.full((m, k), 100.0, dtype=torch.float16)
+    weight = torch.full((n, k), 10.0, dtype=torch.float16)
+
+    packed = ops.zdnn_convert_weight_packed(weight, None)
+    out = ops.zdnn_weight_packed_linear(x, packed, n)
+
+    assert out.isinf().all()
