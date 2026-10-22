@@ -179,6 +179,16 @@ constexpr int64_t kGemvMaxM = 8;
 // 16-column tiles reuse it from L1 and each line is fetched from memory once.
 constexpr int64_t kGemvKBlock = 256;
 
+// Requests the next K block of a weight group while the current one is
+// computed, so each thread keeps many cache-line fetches in flight.
+inline void prefetch_rows(const uint16_t* rows, int64_t n) {
+  constexpr int64_t kLineBytes = 256;
+  const auto* p = reinterpret_cast<const char*>(rows);
+  for (int64_t off = 0; off < n * kStickCols * 2; off += kLineBytes) {
+    __builtin_prefetch(p + off);
+  }
+}
+
 // Splits K so the (group, split) work items divide evenly across threads;
 // otherwise e.g. 40 groups on 16 threads leaves the slowest thread 3 groups.
 int64_t gemv_k_splits(int64_t groups, int64_t K) {
@@ -265,6 +275,17 @@ void gemv_packed_linear(scalar_t* out, int64_t ldo, const scalar_t* mat1,
           reinterpret_cast<const uint16_t*>(w_base + g * group_bytes);
       for (int64_t kb = k0; kb < k1; kb += kGemvKBlock) {
         const int32_t kn = std::min(kGemvKBlock, k1 - kb);
+        if (kb + kGemvKBlock < k1) {
+          prefetch_rows(wg + (kb + kGemvKBlock) * kStickCols,
+                        std::min(kGemvKBlock, k1 - kb - kGemvKBlock));
+        } else if (item + 1 < end) {
+          const int64_t g1 = (item + 1) / splits;
+          const int64_t kb1 = (item + 1) % splits * split_k;
+          prefetch_rows(
+              reinterpret_cast<const uint16_t*>(w_base + g1 * group_bytes) +
+                  kb1 * kStickCols,
+              std::min(kGemvKBlock, K - kb1));
+        }
         for (int64_t t = 0; t < cols; t += tile_n) {
           for (int64_t m0 = 0; m0 < M; m0 += gemm_t::MaxMSize) {
             gemm_t::gemm(a + m0 * K + kb, wg + kb * kStickCols + t,
